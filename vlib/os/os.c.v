@@ -1007,6 +1007,14 @@ pub fn is_atty(fd int) int {
 	}
 }
 
+pub fn is_pipe_tty(fd int) int {
+	$if windows {
+		return is_win_pipe_tty(fd)
+	} $else {
+		return if is_atty(fd) == 0 { 0b00 } else { 0b01 }
+	}
+}
+
 // write_file_array writes the data in `buffer` to a file in `path`.
 pub fn write_file_array(path string, buffer array) ! {
 	mut f := create(path)!

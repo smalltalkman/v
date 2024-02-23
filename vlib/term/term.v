@@ -208,6 +208,9 @@ fn supports_escape_sequences(fd int) bool {
 		if env_conemu == 'ON' {
 			return true
 		}
+		if os.is_pipe_tty(fd) & 0b1 > 0 {
+			return true
+		}
 		// 4 is enable_virtual_terminal_processing
 		return (os.is_atty(fd) & 0x0004) > 0
 	} $else {

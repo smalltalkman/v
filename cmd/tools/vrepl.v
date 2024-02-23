@@ -31,7 +31,7 @@ mut:
 	eval_func_lines []string // same line of the `VSTARTUP` file, but used to test fn type
 }
 
-const is_stdin_a_pipe = os.is_atty(0) == 0
+const is_stdin_a_pipe = os.is_pipe_tty(0) & 0b1 == 0
 const vexe = os.getenv('VEXE')
 const vstartup = os.getenv('VSTARTUP')
 const repl_folder = os.join_path(os.vtmp_dir(), 'repl')

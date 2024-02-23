@@ -62,6 +62,16 @@ fn builtin_init() {
 			C.setbuf(C.stderr, 0)
 		}
 	}
+	if is_win_pipe_tty(1) == 0b11 {
+		unsafe {
+			C.setbuf(C.stdout, 0)
+		}
+	}
+	if is_win_pipe_tty(2) == 0b11 {
+		unsafe {
+			C.setbuf(C.stderr, 0)
+		}
+	}
 	$if !no_backtrace ? {
 		add_unhandled_exception_handler()
 	}
@@ -166,4 +176,40 @@ pub fn winapi_lasterr_str() string {
 @[noreturn]
 pub fn panic_lasterr(base string) {
 	panic(base + winapi_lasterr_str())
+}
+
+struct builtin__FileNameInfo {
+pub:
+	file_name_length  u32
+	file_name         [261]u16
+}
+
+fn C.GetFileInformationByHandleEx(voidptr, int, voidptr, int) bool
+
+pub fn get_file_name_by_handle_ex(handle voidptr) (bool, int, string) {
+	unsafe {
+		file_name_info := builtin__FileNameInfo{}
+		status_ok := C.GetFileInformationByHandleEx(handle, 2, &file_name_info, sizeof(file_name_info))
+		file_name_length := file_name_info.file_name_length
+		file_name := string_from_wide2(&file_name_info.file_name[0], file_name_length)
+		return status_ok, file_name_length, file_name
+	}
+}
+
+pub fn is_win_pipe_tty(fd int) int {
+	osfh := voidptr(C._get_osfhandle(fd))
+	status_ok, file_name_length, file_name := get_file_name_by_handle_ex(osfh)
+	if !status_ok {
+		return 0b01
+	}
+	if file_name_length == 0 {
+		return 0b00
+	}
+	if file_name.contains('msys-') && ! file_name.contains('-pipe-') {
+		return 0b11
+	}
+	if file_name.contains('-pipe-') {
+		return 0b10
+	}
+	return 0b10
 }

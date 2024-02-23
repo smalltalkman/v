@@ -71,7 +71,7 @@ fn main() {
 	if args.len == 0 || args[0] in ['-', 'repl'] {
 		if args.len == 0 {
 			// Running `./v` without args launches repl
-			if os.is_atty(0) == 0 {
+			if os.is_pipe_tty(0) & 0b1 == 0 {
 				mut args_and_flags := util.join_env_vflags_and_os_args()[1..].clone()
 				args_and_flags << ['run', '-']
 				pref.parse_args_and_show_errors(external_tools, args_and_flags, true)
