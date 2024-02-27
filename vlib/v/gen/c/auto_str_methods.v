@@ -262,7 +262,7 @@ fn (mut g Gen) gen_str_for_alias(info ast.Alias, styp string, str_fn_name string
 		deref, _ := deref_kind(str_method_expects_ptr, info.parent_type.is_ptr(), info.parent_type)
 		g.auto_str_funcs.writeln('\tstring tmp_ds = ${parent_str_fn_name}(${deref}it);')
 	}
-	g.auto_str_funcs.writeln('\tstring res = str_intp(3, _MOV((StrIntpData[]){
+	g.auto_str_funcs.writeln('\tstring res = str_intp(3, _MOV((${g.cname('StrIntpData')}[]){
 		{_SLIT0, ${c.si_s_code}, {.d_s = indents }},
 		{_SLIT("${clean_type_v_type_name}("), ${c.si_s_code}, {.d_s = tmp_ds }},
 		{_SLIT(")"), 0, {.d_c = 0 }}
@@ -384,7 +384,7 @@ fn (mut g Gen) gen_str_for_interface(info ast.Interface, styp string, typ_str st
 				val += ', indent_count'
 			}
 			val += ')'
-			res := 'str_intp(2, _MOV((StrIntpData[]){
+			res := 'str_intp(2, _MOV((${g.cname('StrIntpData')}[]){
 				{_SLIT("${clean_interface_v_type_name}(\'"), ${c.si_s_code}, {.d_s = ${val}}},
 				{_SLIT("\')"), 0, {.d_c = 0 }}
 			}))'
@@ -396,7 +396,7 @@ fn (mut g Gen) gen_str_for_interface(info ast.Interface, styp string, typ_str st
 				val += ', indent_count'
 			}
 			val += ')'
-			res := 'str_intp(2, _MOV((StrIntpData[]){
+			res := 'str_intp(2, _MOV((${g.cname('StrIntpData')}[]){
 				{_SLIT("${clean_interface_v_type_name}("), ${c.si_s_code}, {.d_s = ${val}}},
 				{_SLIT(")"), 0, {.d_c = 0 }}
 			}))'
@@ -444,7 +444,7 @@ fn (mut g Gen) gen_str_for_union_sum_type(info ast.SumType, styp string, typ_str
 				val += ', indent_count'
 			}
 			val += ')'
-			res := 'str_intp(2, _MOV((StrIntpData[]){
+			res := 'str_intp(2, _MOV((${g.cname('StrIntpData')}[]){
 				{_SLIT("${clean_sum_type_v_type_name}(\'"), ${c.si_s_code}, {.d_s = ${val}}},
 				{_SLIT("\')"), 0, {.d_c = 0 }}
 			}))'
@@ -455,7 +455,7 @@ fn (mut g Gen) gen_str_for_union_sum_type(info ast.SumType, styp string, typ_str
 				val += ', indent_count'
 			}
 			val += ')'
-			res := 'str_intp(2, _MOV((StrIntpData[]){
+			res := 'str_intp(2, _MOV((${g.cname('StrIntpData')}[]){
 				{_SLIT("${clean_sum_type_v_type_name}("), ${c.si_s_code}, {.d_s = ${val}}},
 				{_SLIT(")"), 0, {.d_c = 0 }}
 			}))'
@@ -598,15 +598,15 @@ fn (mut g Gen) gen_str_for_array(info ast.Array, styp string, str_fn_name string
 			}
 		} else if sym.kind == .rune {
 			// Rune are managed at this level as strings
-			g.auto_str_funcs.writeln('\t\tstring x = str_intp(2, _MOV((StrIntpData[]){{_SLIT("\`"), ${c.si_s_code}, {.d_s = ${elem_str_fn_name}(it) }}, {_SLIT("\`"), 0, {.d_c = 0 }}}));\n')
+			g.auto_str_funcs.writeln('\t\tstring x = str_intp(2, _MOV((${g.cname('StrIntpData')}[]){{_SLIT("\`"), ${c.si_s_code}, {.d_s = ${elem_str_fn_name}(it) }}, {_SLIT("\`"), 0, {.d_c = 0 }}}));\n')
 		} else if sym.kind == .string {
 			if typ.has_flag(.option) {
 				func := g.get_str_fn(typ)
 				g.auto_str_funcs.writeln('\t\tstring x = ${func}(it);\n')
 			} else if is_elem_ptr {
-				g.auto_str_funcs.writeln('\t\tstring x = str_intp(2, _MOV((StrIntpData[]){{_SLIT("&\'"), ${c.si_s_code}, {.d_s = *it }}, {_SLIT("\'"), 0, {.d_c = 0 }}}));\n')
+				g.auto_str_funcs.writeln('\t\tstring x = str_intp(2, _MOV((${g.cname('StrIntpData')}[]){{_SLIT("&\'"), ${c.si_s_code}, {.d_s = *it }}, {_SLIT("\'"), 0, {.d_c = 0 }}}));\n')
 			} else {
-				g.auto_str_funcs.writeln('\t\tstring x = str_intp(2, _MOV((StrIntpData[]){{_SLIT("\'"), ${c.si_s_code}, {.d_s = it }}, {_SLIT("\'"), 0, {.d_c = 0 }}}));\n')
+				g.auto_str_funcs.writeln('\t\tstring x = str_intp(2, _MOV((${g.cname('StrIntpData')}[]){{_SLIT("\'"), ${c.si_s_code}, {.d_s = it }}, {_SLIT("\'"), 0, {.d_c = 0 }}}));\n')
 			}
 		} else {
 			// There is a custom .str() method, so use it.
@@ -763,13 +763,13 @@ fn (mut g Gen) gen_str_for_map(info ast.Map, styp string, str_fn_name string) {
 	g.auto_str_funcs.writeln('\tstrings__Builder_write_string(&sb, _SLIT("{"));')
 	g.auto_str_funcs.writeln('\tbool is_first = true;')
 	g.auto_str_funcs.writeln('\tfor (int i = 0; i < m.key_values.len; ++i) {')
-	g.auto_str_funcs.writeln('\t\tif (!DenseArray_has_index(&m.key_values, i)) { continue; }')
+	g.auto_str_funcs.writeln('\t\tif (!${g.cname('DenseArray')}_has_index(&m.key_values, i)) { continue; }')
 	g.auto_str_funcs.writeln('\t\telse if (!is_first) { strings__Builder_write_string(&sb, _SLIT(", ")); }')
 
 	if key_sym.kind == .string {
-		g.auto_str_funcs.writeln('\t\tstring key = *(string*)DenseArray_key(&m.key_values, i);')
+		g.auto_str_funcs.writeln('\t\tstring key = *(string*)${g.cname('DenseArray')}_key(&m.key_values, i);')
 	} else {
-		g.auto_str_funcs.writeln('\t\t${key_styp} key = *(${key_styp}*)DenseArray_key(&m.key_values, i);')
+		g.auto_str_funcs.writeln('\t\t${key_styp} key = *(${key_styp}*)${g.cname('DenseArray')}_key(&m.key_values, i);')
 	}
 	if key_sym.kind == .string {
 		g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${str_intp_sq('key')});')
@@ -785,18 +785,18 @@ fn (mut g Gen) gen_str_for_map(info ast.Map, styp string, str_fn_name string) {
 	} else if val_sym.kind == .string {
 		if val_typ.has_flag(.option) {
 			func := g.get_str_fn(val_typ)
-			g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${func}(*(${val_styp}*)DenseArray_value(&m.key_values, i)));')
+			g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${func}(*(${val_styp}*)${g.cname('DenseArray')}_value(&m.key_values, i)));')
 		} else {
-			tmp_str := str_intp_sq('*(${val_styp}*)DenseArray_value(&m.key_values, i)')
+			tmp_str := str_intp_sq('*(${val_styp}*)${g.cname('DenseArray')}_value(&m.key_values, i)')
 			g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${tmp_str});')
 		}
 	} else if should_use_indent_func(val_sym.kind) && fn_str.name != 'str' {
 		ptr_str := '*'.repeat(val_typ.nr_muls())
-		g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, indent_${elem_str_fn_name}(*${ptr_str}(${val_styp}*)DenseArray_value(&m.key_values, i), indent_count));')
+		g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, indent_${elem_str_fn_name}(*${ptr_str}(${val_styp}*)${g.cname('DenseArray')}_value(&m.key_values, i), indent_count));')
 	} else if val_sym.kind in [.f32, .f64] {
-		tmp_val := '*(${val_styp}*)DenseArray_value(&m.key_values, i)'
+		tmp_val := '*(${val_styp}*)${g.cname('DenseArray')}_value(&m.key_values, i)'
 		if val_typ.has_flag(.option) {
-			g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${g.get_str_fn(val_typ)}(*(${val_styp}*)DenseArray_value(&m.key_values, i)));')
+			g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${g.get_str_fn(val_typ)}(*(${val_styp}*)${g.cname('DenseArray')}_value(&m.key_values, i)));')
 		} else {
 			if val_sym.kind == .f32 {
 				g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${str_intp_g32(tmp_val)});')
@@ -805,16 +805,16 @@ fn (mut g Gen) gen_str_for_map(info ast.Map, styp string, str_fn_name string) {
 			}
 		}
 	} else if val_sym.kind == .rune {
-		tmp_str := str_intp_rune('${elem_str_fn_name}(*(${val_styp}*)DenseArray_value(&m.key_values, i))')
+		tmp_str := str_intp_rune('${elem_str_fn_name}(*(${val_styp}*)${g.cname('DenseArray')}_value(&m.key_values, i))')
 		g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${tmp_str});')
 	} else {
 		ptr_str := '*'.repeat(val_typ.nr_muls())
 		if val_typ.has_flag(.option) {
-			g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${g.get_str_fn(val_typ)}(*${ptr_str}(${val_styp}*)DenseArray_value(&m.key_values, i)));')
+			g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${g.get_str_fn(val_typ)}(*${ptr_str}(${val_styp}*)${g.cname('DenseArray')}_value(&m.key_values, i)));')
 		} else if receiver_is_ptr {
-			g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${elem_str_fn_name}(${ptr_str}(${val_styp}*)DenseArray_value(&m.key_values, i)));')
+			g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${elem_str_fn_name}(${ptr_str}(${val_styp}*)${g.cname('DenseArray')}_value(&m.key_values, i)));')
 		} else {
-			g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${elem_str_fn_name}(*${ptr_str}(${val_styp}*)DenseArray_value(&m.key_values, i)));')
+			g.auto_str_funcs.writeln('\t\tstrings__Builder_write_string(&sb, ${elem_str_fn_name}(*${ptr_str}(${val_styp}*)${g.cname('DenseArray')}_value(&m.key_values, i)));')
 		}
 	}
 	g.auto_str_funcs.writeln('\t\tis_first = false;')
@@ -916,7 +916,7 @@ fn (mut g Gen) gen_str_for_struct(info ast.Struct, lang ast.Language, styp strin
 			}
 		}
 	}
-	fn_body.writeln('\tstring res = str_intp( ${(info.fields.len - field_skips.len) * 4 + 3}, _MOV((StrIntpData[]){')
+	fn_body.writeln('\tstring res = str_intp( ${(info.fields.len - field_skips.len) * 4 + 3}, _MOV((${g.cname('StrIntpData')}[]){')
 	fn_body.writeln('\t\t{_SLIT("${clean_struct_v_type_name}{\\n"), 0, {.d_c=0}},')
 
 	allow_circular := info.attrs.any(it.name == 'autostr' && it.arg == 'allowrecurse')
@@ -990,7 +990,7 @@ fn (mut g Gen) gen_str_for_struct(info ast.Struct, lang ast.Language, styp strin
 		}
 
 		mut funcprefix := ''
-		mut func, mut caller_should_free := struct_auto_str_func(sym, lang, field.typ,
+		mut func, mut caller_should_free := struct_auto_str_func(g, sym, lang, field.typ,
 			field_styp_fn_name, field.name, sym_has_str_method, str_method_expects_ptr)
 		ftyp_nr_muls := field.typ.nr_muls()
 		field_name := if lang == .c { field.name } else { c_name(field.name) }
@@ -1062,7 +1062,7 @@ fn (mut g Gen) gen_str_for_struct(info ast.Struct, lang ast.Language, styp strin
 	fn_body.writeln('\t}));')
 }
 
-fn struct_auto_str_func(sym &ast.TypeSymbol, lang ast.Language, _field_type ast.Type, fn_name string, field_name string, has_custom_str bool, expects_ptr bool) (string, bool) {
+fn struct_auto_str_func(g Gen, sym &ast.TypeSymbol, lang ast.Language, _field_type ast.Type, fn_name string, field_name string, has_custom_str bool, expects_ptr bool) (string, bool) {
 	$if trace_autostr ? {
 		eprintln('> struct_auto_str_func: ${sym.name} | field_type.debug() | ${fn_name} | ${field_name} | ${has_custom_str} | ${expects_ptr}')
 	}
@@ -1108,22 +1108,22 @@ fn struct_auto_str_func(sym &ast.TypeSymbol, lang ast.Language, _field_type ast.
 		} else if (field_type.is_int_valptr() || field_type.is_float_valptr()) && !expects_ptr {
 			// ptr int can be "nil", so this needs to be casted to a string
 			if sym.kind == .f32 {
-				return 'str_intp(1, _MOV((StrIntpData[]){
+				return 'str_intp(1, _MOV((${g.cname('StrIntpData')}[]){
 					{_SLIT0, ${si_g32_code}, {.d_f32 = *${method_str} }}
 				}))', true
 			} else if sym.kind == .f64 {
-				return 'str_intp(1, _MOV((StrIntpData[]){
+				return 'str_intp(1, _MOV((${g.cname('StrIntpData')}[]){
 					{_SLIT0, ${si_g64_code}, {.d_f64 = *${method_str} }}
 				}))', true
 			} else if sym.kind in [.u64, .usize] {
 				fmt_type := StrIntpType.si_u64
-				return 'str_intp(1, _MOV((StrIntpData[]){{_SLIT0, ${u32(fmt_type) | 0xfe00}, {.d_u64 = *${method_str} }}}))', true
+				return 'str_intp(1, _MOV((${g.cname('StrIntpData')}[]){{_SLIT0, ${u32(fmt_type) | 0xfe00}, {.d_u64 = *${method_str} }}}))', true
 			} else if sym.kind in [.i64, .isize] {
 				fmt_type := StrIntpType.si_i64
-				return 'str_intp(1, _MOV((StrIntpData[]){{_SLIT0, ${u32(fmt_type) | 0xfe00}, {.d_i64 = *${method_str} }}}))', true
+				return 'str_intp(1, _MOV((${g.cname('StrIntpData')}[]){{_SLIT0, ${u32(fmt_type) | 0xfe00}, {.d_i64 = *${method_str} }}}))', true
 			}
 			fmt_type := StrIntpType.si_i32
-			return 'str_intp(1, _MOV((StrIntpData[]){{_SLIT0, ${u32(fmt_type) | 0xfe00}, {.d_i32 = *${method_str} }}}))', true
+			return 'str_intp(1, _MOV((${g.cname('StrIntpData')}[]){{_SLIT0, ${u32(fmt_type) | 0xfe00}, {.d_i32 = *${method_str} }}}))', true
 		}
 		return method_str, false
 	}
