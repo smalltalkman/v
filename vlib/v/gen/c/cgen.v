@@ -7693,3 +7693,8 @@ fn (mut g Gen) check_noscan(elem_typ ast.Type) string {
 	}
 	return ''
 }
+
+fn (mut g Gen) cname(name string) string {
+	idx := g.table.type_idxs[name]
+	return g.table.type_symbols[idx].cname
+}

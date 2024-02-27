@@ -78,6 +78,9 @@ fn (mut p Parser) struct_decl(is_anon bool) ast.StructDecl {
 		name = 'WASM.${name}'
 		orig_name = name
 	} else {
+		if p.builtin_mod && !builtins.contains(name) {
+			p.table.register_sym(kind: .placeholder, name: name)
+		}
 		name = p.prepend_mod(name)
 	}
 	mut ast_fields := []ast.StructField{}
@@ -346,7 +349,7 @@ fn (mut p Parser) struct_decl(is_anon bool) ast.StructDecl {
 	mut sym := ast.TypeSymbol{
 		kind: .struct_
 		language: language
-		name: name
+		name: if p.builtin_mod { orig_name } else { name }
 		cname: util.no_dots(name)
 		mod: p.mod
 		info: ast.Struct{

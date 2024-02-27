@@ -138,7 +138,7 @@ fn (mut g Gen) gen_assert_metainfo(node ast.AssertStmt, kind AssertMetainfoKind)
 	}
 	src = cestring(src)
 	metaname := 'v_assert_meta_info_${g.new_tmp_var()}'
-	g.writeln('\tVAssertMetaInfo ${metaname} = {0};')
+	g.writeln('\t${g.cname('VAssertMetaInfo')} ${metaname} = {0};')
 	g.writeln('\t${metaname}.fpath = ${ctoslit(mod_path)};')
 	g.writeln('\t${metaname}.line_nr = ${line_nr};')
 	g.writeln('\t${metaname}.fn_name = ${ctoslit(fn_name)};')

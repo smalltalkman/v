@@ -15,6 +15,9 @@ import os
 import hash.fnv1a
 import strings
 
+const builtins = ['DenseArray', 'StrIntpData', 'VCastTypeIndexName', '_option', '_result', 'array',
+	'map', 'string']
+
 @[minify]
 pub struct Parser {
 	pref &pref.Preferences = unsafe { nil }
@@ -4260,7 +4263,7 @@ fn (mut p Parser) enum_decl() ast.EnumDecl {
 
 	idx := p.table.register_sym(ast.TypeSymbol{
 		kind: .enum_
-		name: name
+		name: if p.builtin_mod { enum_name } else { name }
 		cname: util.no_dots(name)
 		mod: p.mod
 		info: ast.Enum{
