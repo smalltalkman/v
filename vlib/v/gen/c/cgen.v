@@ -7214,14 +7214,14 @@ fn (mut g Gen) as_cast(node ast.AsCast) {
 
 fn (g Gen) as_cast_name_table() string {
 	if g.as_cast_type_names.len == 0 {
-		return 'new_array_from_c_array(1, 1, sizeof(VCastTypeIndexName), _MOV((VCastTypeIndexName[1]){(VCastTypeIndexName){.tindex = 0,.tname = _SLIT("unknown")}}));\n'
+		return 'new_array_from_c_array(1, 1, sizeof(${g.cname('VCastTypeIndexName')}), _MOV((${g.cname('VCastTypeIndexName')}[1]){(${g.cname('VCastTypeIndexName')}){.tindex = 0,.tname = _SLIT("unknown")}}));\n'
 	}
 	mut name_ast := strings.new_builder(1024)
 	casts_len := g.as_cast_type_names.len + 1
-	name_ast.writeln('new_array_from_c_array(${casts_len}, ${casts_len}, sizeof(VCastTypeIndexName), _MOV((VCastTypeIndexName[${casts_len}]){')
-	name_ast.writeln('\t\t  (VCastTypeIndexName){.tindex = 0, .tname = _SLIT("unknown")}')
+	name_ast.writeln('new_array_from_c_array(${casts_len}, ${casts_len}, sizeof(${g.cname('VCastTypeIndexName')}), _MOV((${g.cname('VCastTypeIndexName')}[${casts_len}]){')
+	name_ast.writeln('\t\t  (${g.cname('VCastTypeIndexName')}){.tindex = 0, .tname = _SLIT("unknown")}')
 	for key, value in g.as_cast_type_names {
-		name_ast.writeln('\t\t, (VCastTypeIndexName){.tindex = ${key}, .tname = _SLIT("${value}")}')
+		name_ast.writeln('\t\t, (${g.cname('VCastTypeIndexName')}){.tindex = ${key}, .tname = _SLIT("${value}")}')
 	}
 	name_ast.writeln('\t}));\n')
 	return name_ast.str()
@@ -7692,4 +7692,9 @@ fn (mut g Gen) check_noscan(elem_typ ast.Type) string {
 		}
 	}
 	return ''
+}
+
+fn (g Gen) cname(name string) string {
+	idx := g.table.type_idxs[name]
+	return g.table.type_symbols[idx].cname
 }

@@ -16,7 +16,20 @@ fn (p &Parser) prepend_mod(name string) string {
 		return p.expr_mod + '.' + name
 	}
 	if p.builtin_mod {
-		return name
+		if p.pref.backend.is_js() {
+			return name
+		}
+		if name in ['_option', '_result'] {
+			return name
+		}
+		type_idx := p.table.type_idxs[name]
+		if type_idx in [ast.string_type_idx, ast.rune_type_idx, ast.array_type_idx, ast.map_type_idx] {
+			return name
+		}
+		type_symbol := p.table.type_symbols[type_idx]
+		if type_idx == 0 || type_symbol.is_builtin() {
+			return name
+		}
 	}
 	return p.mod + '.' + name
 }
