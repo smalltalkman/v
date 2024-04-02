@@ -756,7 +756,7 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 		methods_with_attrs := sym.methods.filter(it.attrs.len > 0) // methods with attrs second
 		methods << methods_with_attrs
 		if methods.len > 0 {
-			g.writeln('FunctionData ${node.val_var} = {0};')
+			g.writeln('${g.cname('FunctionData')} ${node.val_var} = {0};')
 		}
 		typ_vweb_result := g.table.find_type_idx('vweb.Result')
 		for method in methods {
@@ -788,10 +788,10 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 			}
 			if method.params.len < 2 {
 				// 0 or 1 (the receiver) args
-				g.writeln('\t${node.val_var}.args = __new_array_with_default(0, 0, sizeof(MethodArgs), 0);')
+				g.writeln('\t${node.val_var}.args = __new_array_with_default(0, 0, sizeof(${g.cname('MethodArgs')}), 0);')
 			} else {
 				len := method.params.len - 1
-				g.write('\t${node.val_var}.args = new_array_from_c_array(${len}, ${len}, sizeof(MethodArgs), _MOV((MethodArgs[${len}]){')
+				g.write('\t${node.val_var}.args = new_array_from_c_array(${len}, ${len}, sizeof(${g.cname('MethodArgs')}), _MOV((${g.cname('MethodArgs')}[${len}]){')
 				// Skip receiver arg
 				for j, arg in method.params[1..] {
 					typ := arg.typ.idx()
@@ -848,7 +848,7 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 				}
 			}
 			if fields.len > 0 {
-				g.writeln('\tFieldData ${node.val_var} = {0};')
+				g.writeln('\t${g.cname('FieldData')} ${node.val_var} = {0};')
 			}
 			g.push_new_comptime_info()
 			for field in fields {
@@ -900,7 +900,7 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 		if sym.kind == .enum_ {
 			if sym.info is ast.Enum {
 				if sym.info.vals.len > 0 {
-					g.writeln('\tEnumData ${node.val_var} = {0};')
+					g.writeln('\t${g.cname('EnumData')} ${node.val_var} = {0};')
 				}
 				g.push_new_comptime_info()
 				for val in sym.info.vals {
@@ -934,14 +934,14 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 	} else if node.kind == .attributes {
 		attrs := g.table.get_attrs(sym)
 		if attrs.len > 0 {
-			g.writeln('\tVAttribute ${node.val_var} = {0};')
+			g.writeln('\t${g.cname('VAttribute')} ${node.val_var} = {0};')
 
 			for attr in attrs {
 				g.writeln('/* attribute ${i} */ {')
 				g.writeln('\t${node.val_var}.name = _SLIT("${attr.name}");')
 				g.writeln('\t${node.val_var}.has_arg = ${attr.has_arg};')
 				g.writeln('\t${node.val_var}.arg = _SLIT("${attr.arg}");')
-				g.writeln('\t${node.val_var}.kind = AttributeKind__${attr.kind};')
+				g.writeln('\t${node.val_var}.kind = ${g.cname('AttributeKind')}__${attr.kind};')
 				g.stmts(node.stmts)
 				g.writeln('}')
 				i++
@@ -950,7 +950,7 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 	} else if node.kind == .variants {
 		if sym.info is ast.SumType {
 			if sym.info.variants.len > 0 {
-				g.writeln('\tVariantData ${node.val_var} = {0};')
+				g.writeln('\t${g.cname('VariantData')} ${node.val_var} = {0};')
 			}
 			g.comptime.inside_comptime_for = true
 			g.push_new_comptime_info()

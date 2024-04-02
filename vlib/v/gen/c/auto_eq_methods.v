@@ -487,8 +487,8 @@ fn (mut g Gen) gen_map_equality_fn(left_type ast.Type) string {
 	fn_builder.writeln('\t\treturn false;')
 	fn_builder.writeln('\t}')
 	fn_builder.writeln('\tfor (int i = 0; i < ${key_values}.len; ++i) {')
-	fn_builder.writeln('\t\tif (!DenseArray_has_index(&${key_values}, i)) continue;')
-	fn_builder.writeln('\t\tvoidptr k = DenseArray_key(&${key_values}, i);')
+	fn_builder.writeln('\t\tif (!${g.cname('DenseArray')}_has_index(&${key_values}, i)) continue;')
+	fn_builder.writeln('\t\tvoidptr k = ${g.cname('DenseArray')}_key(&${key_values}, i);')
 	fn_builder.writeln('\t\tif (!map_exists(${b}, k)) return false;')
 	kind := g.table.type_kind(value.typ)
 	if kind == .function {

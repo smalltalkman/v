@@ -366,11 +366,11 @@ fn (mut g Gen) for_in_stmt(node_ ast.ForInStmt) {
 		g.writeln('\t${idx} = -1;')
 		g.writeln('\tcontinue;')
 		g.writeln('}')
-		g.writeln('if (!DenseArray_has_index(&${cond_var}${dot_or_ptr}key_values, ${idx})) {continue;}')
+		g.writeln('if (!${g.cname('DenseArray')}_has_index(&${cond_var}${dot_or_ptr}key_values, ${idx})) {continue;}')
 		if node.key_var != '_' {
 			key_styp := g.typ(node.key_type)
 			key := c_name(node.key_var)
-			g.writeln('${key_styp} ${key} = /*key*/ *(${key_styp}*)DenseArray_key(&${cond_var}${dot_or_ptr}key_values, ${idx});')
+			g.writeln('${key_styp} ${key} = /*key*/ *(${key_styp}*)${g.cname('DenseArray')}_key(&${cond_var}${dot_or_ptr}key_values, ${idx});')
 			// TODO: analyze whether node.key_type has a .clone() method and call .clone() for all types:
 			if node.key_type == ast.string_type {
 				g.writeln('${key} = string_clone(${key});')
@@ -381,11 +381,11 @@ fn (mut g Gen) for_in_stmt(node_ ast.ForInStmt) {
 			if val_sym.kind == .function {
 				g.write_fn_ptr_decl(val_sym.info as ast.FnType, c_name(node.val_var))
 				g.write(' = (*(voidptr*)')
-				g.writeln('DenseArray_value(&${cond_var}${dot_or_ptr}key_values, ${idx}));')
+				g.writeln('${g.cname('DenseArray')}_value(&${cond_var}${dot_or_ptr}key_values, ${idx}));')
 			} else if val_sym.kind == .array_fixed && !node.val_is_mut {
 				val_styp := g.typ(node.val_type)
 				g.writeln('${val_styp} ${c_name(node.val_var)};')
-				g.writeln('memcpy(*(${val_styp}*)${c_name(node.val_var)}, (byte*)DenseArray_value(&${cond_var}${dot_or_ptr}key_values, ${idx}), sizeof(${val_styp}));')
+				g.writeln('memcpy(*(${val_styp}*)${c_name(node.val_var)}, (byte*)${g.cname('DenseArray')}_value(&${cond_var}${dot_or_ptr}key_values, ${idx}), sizeof(${val_styp}));')
 			} else {
 				val_styp := g.typ(node.val_type)
 				if node.val_type.is_ptr() {
@@ -397,7 +397,7 @@ fn (mut g Gen) for_in_stmt(node_ ast.ForInStmt) {
 				} else {
 					g.write('${val_styp} ${c_name(node.val_var)} = (*(${val_styp}*)')
 				}
-				g.writeln('DenseArray_value(&${cond_var}${dot_or_ptr}key_values, ${idx}));')
+				g.writeln('${g.cname('DenseArray')}_value(&${cond_var}${dot_or_ptr}key_values, ${idx}));')
 			}
 		}
 		g.indent--

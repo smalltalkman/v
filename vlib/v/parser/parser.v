@@ -4146,6 +4146,9 @@ fn (mut p Parser) enum_decl() ast.EnumDecl {
 			end_pos)
 		return ast.EnumDecl{}
 	}
+	if p.builtin_mod {
+		p.table.register_sym(name: enum_name)
+	}
 	name := p.prepend_mod(enum_name)
 	mut enum_type := ast.int_type
 	mut typ_pos := token.Pos{}
@@ -4283,7 +4286,7 @@ fn (mut p Parser) enum_decl() ast.EnumDecl {
 
 	idx := p.table.register_sym(ast.TypeSymbol{
 		kind: .enum_
-		name: name
+		name: if p.builtin_mod { enum_name } else { name }
 		cname: util.no_dots(name)
 		mod: p.mod
 		info: ast.Enum{
