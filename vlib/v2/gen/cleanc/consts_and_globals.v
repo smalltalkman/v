@@ -669,6 +669,9 @@ fn (mut g Gen) gen_const_decl(node ast.ConstDecl) {
 			g.sb.write_string('#define ${name} ')
 			g.expr(field.value)
 			g.sb.writeln('')
+			if typ != '' && typ != 'int' {
+				g.const_types[name] = typ
+			}
 		}
 	}
 }

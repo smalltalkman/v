@@ -137,13 +137,19 @@ fn (mut t Transformer) apply_smartcast_field_access_ctx(sumtype_expr ast.Expr, f
 	// variant (short name) is used for union member access
 	// variant_full (full name) is used for type cast
 	variant_short := ctx.variant
-	// Extract simple variant name for _data._ accessor (strip module prefix)
-	// But preserve composite type prefixes like Array_, Map_, Array_fixed_
+	// Extract simple variant name for _data._ accessor
+	// Union fields use: _Null (same-module Ident), _time__Time (cross-module SelectorExpr),
+	// _Array_json2__Any (composite). Only strip module prefix for same-module types.
 	variant_simple := if variant_short.starts_with('Array_') || variant_short.starts_with('Map_') {
 		// For composite types, use the short name to match union member
 		variant_short
 	} else if variant_short.contains('__') {
-		variant_short.all_after_last('__')
+		mod_prefix := variant_short.all_before_last('__')
+		if mod_prefix == t.cur_module {
+			variant_short.all_after_last('__')
+		} else {
+			variant_short
+		}
 	} else {
 		variant_short
 	}
@@ -169,6 +175,20 @@ fn (mut t Transformer) apply_smartcast_field_access_ctx(sumtype_expr ast.Expr, f
 	// Already concretely casted to this variant by an outer smartcast context.
 	if t.expr_is_casted_to_type(transformed_base, mangled_variant) {
 		return t.synth_selector_from_struct(transformed_base, field_name, mangled_variant)
+	}
+	// For interface smartcasts, use _object instead of _data
+	is_interface_ctx := ctx.sumtype.starts_with('__iface__')
+	if is_interface_ctx {
+		object_access := t.synth_selector(transformed_base, '_object', types.Type(types.voidptr_))
+		cast_expr := ast.CastExpr{
+			typ:  ast.Ident{
+				name: '${mangled_variant}*'
+			}
+			expr: object_access
+		}
+		return t.synth_selector_from_struct(ast.ParenExpr{
+			expr: cast_expr
+		}, field_name, mangled_variant)
 	}
 	// Create data access.
 	// For native backends (arm64/x64): _data is a plain i64 (void pointer) in the SSA struct.

@@ -13,6 +13,12 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 	if rhs is ast.OrExpr && rhs.pos.id == 235054 {
 		panic('debug gen_assign or lhs=${lhs.name()} stmt_pos=${node.pos} rhs_pos=${rhs.pos} file=${g.cur_file_name} fn=${g.cur_fn_name}')
 	}
+	if g.cur_fn_name.contains('get_or_panic') && lhs is ast.Ident && lhs.name.starts_with('_or_t') {
+		rhs_is_call := rhs is ast.CallExpr
+		rhs_is_coc := rhs is ast.CallOrCastExpr
+		rhs_is_ident := rhs is ast.Ident
+		eprintln('DEBUG cleanc assign _or_t: fn=${g.cur_fn_name} lhs=${lhs.name} rhs_is_call=${rhs_is_call} rhs_is_coc=${rhs_is_coc} rhs_is_ident=${rhs_is_ident} rhs_name=${rhs.name()}')
+	}
 
 	// Multi-assignment with parallel RHS values (non-declaration):
 	// `p, q = q, p` needs temp variables for correct swap semantics.
@@ -34,6 +40,11 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 		}
 		// Then assign from temporaries to LHS
 		for i, lhs_expr in node.lhs {
+			if lhs_expr is ast.Ident && lhs_expr.name == '_' {
+				g.write_indent()
+				g.sb.writeln('(void)_swap_${swap_id}_${i};')
+				continue
+			}
 			g.write_indent()
 			g.expr(lhs_expr)
 			g.sb.writeln(' = _swap_${swap_id}_${i};')
@@ -96,6 +107,19 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 					tuple_type = ret
 				}
 			}
+			// For interface vtable method calls, look up the method's return type
+			if (tuple_type == '' || tuple_type == 'int') && rhs.lhs is ast.SelectorExpr {
+				receiver_type := g.get_expr_type(rhs.lhs.lhs).trim_right('*')
+				if g.is_interface_type(receiver_type) {
+					method_name := rhs.lhs.rhs.name
+					if method := g.interface_method_by_name(receiver_type, method_name) {
+						if method.ret_type != '' && method.ret_type != 'int'
+							&& method.ret_type != 'void' {
+							tuple_type = method.ret_type
+						}
+					}
+				}
+			}
 		} else if rhs is ast.UnsafeExpr {
 			// Handle inline or-block expansion: the transformer wraps or-blocks in
 			// UnsafeExpr (GCC statement expressions) when it can't expand them to
@@ -127,6 +151,88 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 				cast_type := g.expr_type_to_c(rhs.typ)
 				if cast_type != '' {
 					tuple_type = cast_type
+				}
+			}
+		}
+		// Function pointer call: tuple_type may be the fn pointer typedef name
+		// (e.g. 'ui__CanvasLayoutSizeFn') or 'int' (unresolved) instead of the actual
+		// return type (e.g. 'Tuple_int_int'). Resolve via the raw type's return type.
+		if tuple_type !in g.tuple_aliases && rhs is ast.CallExpr {
+			// Method 1: Use fn_pointer_return_type on the callee expression
+			fn_ptr_ret := g.fn_pointer_return_type(rhs.lhs)
+			if fn_ptr_ret != '' && fn_ptr_ret != 'int' && fn_ptr_ret in g.tuple_aliases {
+				tuple_type = fn_ptr_ret
+			}
+			// Method 2: For selector-based fn pointer calls, resolve the field's
+			// fn type from the receiver struct and extract the return type.
+			if tuple_type !in g.tuple_aliases && rhs.lhs is ast.SelectorExpr {
+				if receiver_raw := g.get_raw_type(rhs.lhs.lhs) {
+					base_raw := if receiver_raw is types.Pointer {
+						receiver_raw.base_type
+					} else {
+						receiver_raw
+					}
+					if base_raw is types.Struct {
+						field_name := rhs.lhs.rhs.name
+						fn_ret := g.resolve_struct_field_fn_return(base_raw, field_name)
+						if fn_ret != '' && fn_ret in g.tuple_aliases {
+							tuple_type = fn_ret
+						}
+					}
+				}
+			}
+			// Method 3: Try raw type resolution on the callee expression directly
+			if tuple_type !in g.tuple_aliases {
+				if fn_raw := g.get_raw_type(rhs.lhs) {
+					fn_ret_type := match fn_raw {
+						types.FnType {
+							if rt := fn_raw.get_return_type() {
+								g.fn_return_type_to_c(rt)
+							} else {
+								''
+							}
+						}
+						types.Alias {
+							if fn_raw.base_type is types.FnType {
+								if rt := fn_raw.base_type.get_return_type() {
+									g.fn_return_type_to_c(rt)
+								} else {
+									''
+								}
+							} else {
+								''
+							}
+						}
+						else {
+							''
+						}
+					}
+					if fn_ret_type != '' && fn_ret_type != 'int' && fn_ret_type in g.tuple_aliases {
+						tuple_type = fn_ret_type
+					}
+				}
+			}
+		}
+		// If tuple_type is still unresolved (empty, 'int', or 'void'), synthesize from LHS types
+		if (tuple_type == '' || tuple_type == 'int' || tuple_type == 'void')
+			&& tuple_type !in g.tuple_aliases {
+			mut lhs_types := []string{cap: tuple_lhs.len}
+			mut all_resolved := true
+			for lhs_expr in tuple_lhs {
+				mut lhs_t := g.get_expr_type(lhs_expr)
+				if (lhs_t == '' || lhs_t == 'int') && lhs_expr is ast.Ident {
+					lhs_t = g.get_local_var_c_type(lhs_expr.name) or { lhs_t }
+				}
+				if lhs_t == '' {
+					all_resolved = false
+					break
+				}
+				lhs_types << lhs_t
+			}
+			if all_resolved && lhs_types.len > 1 {
+				synthesized := g.register_tuple_alias(lhs_types)
+				if synthesized != '' {
+					tuple_type = synthesized
 				}
 			}
 		}
@@ -259,6 +365,18 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 			}
 		}
 		mut typ := g.get_expr_type(rhs)
+		// For Ident RHS referencing a struct-typed constant (e.g., `col := no_color`
+		// where no_color is `#define`d as a Color struct literal), use the const type.
+		if (typ == 'int' || typ == '') && rhs is ast.Ident {
+			if ct := g.const_types[rhs.name] {
+				typ = ct
+			} else if g.cur_module != '' {
+				qualified := g.cur_module + '__' + rhs.name
+				if ct := g.const_types[qualified] {
+					typ = ct
+				}
+			}
+		}
 		// For CastExpr RHS (e.g., `(i64)(0)`), derive type from the cast target.
 		if rhs is ast.CastExpr {
 			cast_type := g.expr_type_to_c(rhs.typ)
@@ -276,6 +394,43 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 				} else if scope_type == 'int' && typ == 'bool' {
 					// Fix: literal like `1` mistyped as bool in env
 					typ = 'int'
+				}
+			}
+			// Transformer-created temp vars may not exist in the checker's scope.
+			// Try to infer the type from the RHS: if RHS is an Ident referencing
+			// another temp var already registered in runtime_local_types, use that.
+			if typ == 'int' || typ == '' {
+				if rhs is ast.Ident {
+					if rhs_local_type := g.runtime_local_types[rhs.name] {
+						if rhs_local_type != '' && rhs_local_type != 'int' {
+							typ = rhs_local_type
+						}
+					}
+				}
+			}
+			// For UnsafeExpr RHS (GCC statement expression from nested or-expressions),
+			// the result type is determined by the last ExprStmt. Find its declaration
+			// in the preceding stmts to extract the type.
+			if typ == 'int' || typ == '' {
+				if rhs is ast.UnsafeExpr && rhs.stmts.len > 1 {
+					last_s := rhs.stmts[rhs.stmts.len - 1]
+					if last_s is ast.ExprStmt && last_s.expr is ast.Ident {
+						result_name := last_s.expr.name
+						// Scan preceding stmts for the decl_assign of the result variable
+						for inner_stmt in rhs.stmts[..rhs.stmts.len - 1] {
+							if inner_stmt is ast.AssignStmt && inner_stmt.op == .decl_assign
+								&& inner_stmt.lhs.len == 1 {
+								inner_lhs := inner_stmt.lhs[0]
+								if inner_lhs is ast.Ident && inner_lhs.name == result_name {
+									inner_typ := g.get_expr_type(inner_stmt.rhs[0])
+									if inner_typ != '' && inner_typ != 'int' {
+										typ = inner_typ
+									}
+									break
+								}
+							}
+						}
+					}
 				}
 			}
 		}
@@ -361,8 +516,19 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 		// type from the (checker/transformer) scope; this is important for patterns
 		// like `tmp := map__get_check(...)` where the C builtin returns `void*` but
 		// the variable is known to be `T*`.
-		// But skip if element type was already inferred from array methods
-		if !elem_type_from_array && name != '' && g.cur_fn_scope != unsafe { nil } {
+		// But skip if element type was already inferred from array methods.
+		// Also skip for tuple field selectors (_tuple_tN.argN) where the field type
+		// is authoritative — scope lookup may find a wrong-scoped variable of the same name.
+		mut type_from_tuple_field := false
+		if rhs is ast.SelectorExpr {
+			sel_rhs := rhs as ast.SelectorExpr
+			if sel_rhs.rhs.name.starts_with('arg') && sel_rhs.lhs is ast.Ident {
+				sel_lhs := sel_rhs.lhs as ast.Ident
+				type_from_tuple_field = sel_lhs.name.starts_with('_tuple_t')
+			}
+		}
+		if !elem_type_from_array && !type_from_tuple_field && name != ''
+			&& g.cur_fn_scope != unsafe { nil } {
 			if obj := g.cur_fn_scope.lookup_parent(name, 0) {
 				if obj !is types.Module {
 					obj_type := obj.typ()
@@ -393,11 +559,28 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 		}
 		if !elem_type_from_array && rhs is ast.CallExpr {
 			if ret := g.get_call_return_type(rhs.lhs, rhs.args) {
-				if ret != ''
+				if (ret == 'array' && typ.starts_with('Array_'))
+					|| (ret == 'map' && typ.starts_with('Map_')) {
+					// Preserve more specific local container types inferred from call arguments.
+				} else if ret != ''
 					&& (ret != 'int' || typ in ['', 'void*', 'voidptr'] || typ.starts_with('Array_')
 					|| typ.starts_with('Map_')) {
 					if !(ret in ['void*', 'voidptr'] && typ !in ['', 'int', 'void*', 'voidptr']) {
 						typ = ret
+					}
+				}
+			}
+			// For interface vtable method calls (e.g., w->size(w->_object)),
+			// look up the method's return type from the interface declaration.
+			if (typ == '' || typ == 'int') && rhs.lhs is ast.SelectorExpr {
+				receiver_type := g.get_expr_type(rhs.lhs.lhs).trim_right('*')
+				if g.is_interface_type(receiver_type) {
+					iface_method_name := rhs.lhs.rhs.name
+					if method := g.interface_method_by_name(receiver_type, iface_method_name) {
+						if method.ret_type != '' && method.ret_type != 'int'
+							&& method.ret_type != 'void' {
+							typ = method.ret_type
+						}
 					}
 				}
 			}
@@ -705,7 +888,16 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 					g.expr(lhs)
 				}
 				g.sb.write_string(', ')
-				g.gen_addr_of_expr(rhs, elem_type)
+				// When pushing a concrete type into an interface array, wrap it
+				if g.is_interface_type(elem_type) {
+					g.sb.write_string('&(${elem_type}[1]){')
+					if !g.gen_interface_cast(elem_type, rhs) {
+						g.expr(rhs)
+					}
+					g.sb.write_string('}')
+				} else {
+					g.gen_addr_of_expr(rhs, elem_type)
+				}
 				g.sb.writeln(');')
 				return
 			}
@@ -815,14 +1007,41 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 				}
 			}
 		}
+		// When RHS is an array method (first/last/pop/pop_left), the call emission
+		// in fn.v already wraps with (*(elem_type*)call(...)). Skip the outer
+		// assign-level cast to avoid double dereference.
+		mut call_already_casts := false
+		if rhs_array_elem_type != '' {
+			if rhs is ast.CallExpr {
+				if rhs.lhs is ast.Ident
+					&& rhs.lhs.name in ['array__pop', 'array__pop_left', 'array__first', 'array__last']
+					&& rhs.args.len > 0 {
+					call_elem := g.infer_array_elem_type_from_expr(rhs.args[0])
+					if call_elem != '' {
+						call_already_casts = true
+					}
+				}
+			}
+		}
 		if rhs_array_elem_type != '' && assign_lhs_type !in ['', 'void*', 'voidptr']
-			&& !assign_lhs_type.ends_with('*') {
+			&& !assign_lhs_type.ends_with('*') && !call_already_casts {
 			g.sb.write_string('(*(${assign_lhs_type}*)')
 			g.expr(rhs)
 			g.sb.write_string(')')
 		} else if node.op == .assign && assign_lhs_type != '' && !assign_lhs_type.ends_with('*') {
 			rhs_type := g.get_expr_type(rhs)
-			if rhs_type.ends_with('*') {
+			lhs_base := assign_lhs_type.trim_right('*')
+			rhs_base2 := rhs_type.trim_right('*')
+			// Check if LHS is an interface and RHS is a concrete type
+			if g.is_interface_type(lhs_base) && rhs_base2 != '' && rhs_base2 != 'int'
+				&& rhs_base2 != lhs_base && !g.is_interface_type(rhs_base2)
+				&& !lhs_base.starts_with('Array_') && lhs_base != 'array'
+				&& !lhs_base.starts_with('Map_') && lhs_base != 'map' {
+				if g.gen_interface_cast(lhs_base, rhs) {
+				} else {
+					g.expr(rhs)
+				}
+			} else if rhs_type.ends_with('*') {
 				rhs_base := rhs_type.trim_right('*')
 				if rhs_base == assign_lhs_type
 					|| short_type_name(rhs_base) == short_type_name(assign_lhs_type) {
@@ -840,4 +1059,29 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 		}
 		g.sb.writeln(';')
 	}
+}
+
+// resolve_struct_field_fn_return looks up a field by name in a struct type,
+// checks if it's a function pointer (possibly wrapped in an alias), and
+// returns the C type name of the function's return type.
+fn (mut g Gen) resolve_struct_field_fn_return(st types.Struct, field_name string) string {
+	for field in st.fields {
+		if field.name == field_name {
+			ft := field.typ
+			if ft is types.FnType {
+				if rt := ft.get_return_type() {
+					return g.fn_return_type_to_c(rt)
+				}
+			} else if ft is types.Alias {
+				if ft.base_type is types.FnType {
+					fn_t := ft.base_type as types.FnType
+					if rt := fn_t.get_return_type() {
+						return g.fn_return_type_to_c(rt)
+					}
+				}
+			}
+			break
+		}
+	}
+	return ''
 }

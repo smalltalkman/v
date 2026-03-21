@@ -110,6 +110,15 @@ fn (t &Transformer) c_name_to_type(name string) ?types.Type {
 			elem_type: elem_type
 		}
 	}
+	// Handle Map_KEY_VALUE prefix (e.g. Map_string_json2__Any)
+	if name.starts_with('Map_string_') {
+		value_name := name['Map_string_'.len..]
+		value_type := t.c_name_to_type(value_name) or { return none }
+		return types.Map{
+			key_type:   types.string_
+			value_type: value_type
+		}
+	}
 	// Primitives and well-known types
 	return match name {
 		'int' {
@@ -321,6 +330,73 @@ fn (t &Transformer) is_flag_enum(type_name string) bool {
 		return typ.is_flag
 	}
 	return false
+}
+
+// type_expr_to_variant_name converts a type AST expression (like []Any or
+// map[string]Any) to the mangled variant name used in sum type definitions
+// (e.g. Array_json2__Any, Map_string_json2__Any).
+fn (t &Transformer) type_expr_to_variant_name(e ast.Expr) string {
+	if e is ast.Type {
+		return t.type_to_variant_name(e)
+	}
+	if e is ast.Ident {
+		name := (e as ast.Ident).name
+		if t.cur_module != '' && t.cur_module != 'main' && t.cur_module != 'builtin'
+			&& !name.contains('__') && !t.is_builtin_type_name(name) {
+			return '${t.cur_module}__${name}'
+		}
+		return name
+	}
+	if e is ast.SelectorExpr {
+		sel := e as ast.SelectorExpr
+		if sel.lhs is ast.Ident {
+			return '${(sel.lhs as ast.Ident).name}__${sel.rhs.name}'
+		}
+	}
+	return ''
+}
+
+fn (t &Transformer) is_builtin_type_name(name string) bool {
+	return name in ['string', 'int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64',
+		'f32', 'f64', 'bool', 'rune', 'usize', 'isize', 'voidptr', 'byteptr', 'charptr']
+}
+
+// variant_name_to_c converts V-style variant names to C-style for union member access.
+// e.g. "[]json2__Any" → "Array_json2__Any", "map[string]json2__Any" → "Map_string_json2__Any"
+fn (t &Transformer) variant_name_to_c(name string) string {
+	if name.starts_with('[]') {
+		return 'Array_${name[2..]}'
+	}
+	if name.starts_with('map[') {
+		// "map[K]V" → "Map_K_V"
+		bracket_end := name.index_u8(`]`)
+		if bracket_end > 0 {
+			key := name[4..bracket_end]
+			val := name[bracket_end + 1..]
+			return 'Map_${key}_${val}'
+		}
+	}
+	return name
+}
+
+fn (t &Transformer) type_to_variant_name(e ast.Type) string {
+	match e {
+		ast.ArrayType {
+			elem := t.type_expr_to_variant_name(e.elem_type)
+			if elem != '' {
+				return '[]${elem}'
+			}
+		}
+		ast.MapType {
+			key := t.type_expr_to_variant_name(e.key_type)
+			val := t.type_expr_to_variant_name(e.value_type)
+			if key != '' && val != '' {
+				return 'map[${key}]${val}'
+			}
+		}
+		else {}
+	}
+	return ''
 }
 
 // get_sum_type_variants returns the variants for a sum type
@@ -925,6 +1001,42 @@ fn (t &Transformer) resolve_expr_with_expected_type(expr ast.Expr, expected type
 					pos:    expr.pos
 				}
 			}
+		}
+		else {}
+	}
+	match expected {
+		types.OptionType, types.ResultType {
+			match expr {
+				ast.Keyword {
+					if expr.tok == .key_none {
+						return expr
+					}
+				}
+				ast.Ident {
+					if expr.name == 'none' {
+						return expr
+					}
+				}
+				ast.Type {
+					if expr is ast.NoneType {
+						return ast.Expr(ast.Type(expr))
+					}
+				}
+				else {}
+			}
+			if expr_type := t.get_expr_type(expr) {
+				if expected is types.OptionType && expr_type is types.OptionType {
+					return expr
+				}
+				if expected is types.ResultType && expr_type is types.ResultType {
+					return expr
+				}
+			}
+			return ast.Expr(ast.CastExpr{
+				typ:  t.type_to_ast_type_expr(expected)
+				expr: expr
+				pos:  expr.pos()
+			})
 		}
 		else {}
 	}

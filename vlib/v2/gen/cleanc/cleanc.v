@@ -42,6 +42,7 @@ mut:
 	map_aliases                 map[string]bool
 	result_aliases              map[string]bool
 	option_aliases              map[string]bool
+	alias_base_types            map[string]string
 	emitted_result_structs      map[string]bool
 	emitted_option_structs      map[string]bool
 	embedded_field_owner        map[string]string
@@ -52,6 +53,7 @@ mut:
 	// Interface method signatures: interface_name -> [(method_name, cast_signature), ...]
 	interface_methods           map[string][]InterfaceMethodInfo
 	interface_data_fields       map[string][]InterfaceDataFieldInfo
+	interface_decls             map[string]ast.InterfaceDecl
 	emitted_interface_bodies    map[string]bool
 	interface_wrapper_specs     map[string]InterfaceWrapperSpec
 	needed_interface_wrappers   map[string]bool
@@ -74,6 +76,7 @@ mut:
 	cached_env_scopes           map[string]voidptr // cache of env_scope results (avoids repeated locking)
 
 	const_exprs           map[string]string // const name → C expression string (for inlining)
+	const_types           map[string]string // const name → C type string
 	runtime_const_targets map[string]bool   // module-scoped consts initialized in __v_init_consts_*
 	used_fn_keys          map[string]bool
 	force_emit_fn_names   map[string]bool   // function C names that must be emitted regardless of mark_used
@@ -89,7 +92,8 @@ mut:
 	live_source_file string          // source file containing @[live] functions
 	test_fn_names    []string        // test function names collected in Pass 4
 	has_main         bool            // whether a main() function was found in Pass 4
-	fn_owner_file    map[string]int  // fn_key -> first file index (for parallel dedup)
+	fn_owner_file           map[string]int              // fn_key -> first file index (for parallel dedup)
+	generic_struct_bindings map[string]map[string]types.Type // struct_name -> {T: concrete_type}
 	c_file_fn_keys   map[string]bool // fn_key -> emitted from a .c.v file, so plain .v fallback should be skipped
 	typedef_c_types  map[string]bool // C struct names with @[typedef] attribute (emit without 'struct' prefix)
 	blocked_fn_keys  map[string]bool // worker-only fn keys reserved to other pass5 chunks
@@ -186,6 +190,7 @@ pub fn Gen.new_with_env_and_pref(files []ast.File, env &types.Environment, p &pr
 		map_aliases:                 map[string]bool{}
 		result_aliases:              map[string]bool{}
 		option_aliases:              map[string]bool{}
+		alias_base_types:            map[string]string{}
 		emitted_result_structs:      map[string]bool{}
 		emitted_option_structs:      map[string]bool{}
 		embedded_field_owner:        map[string]string{}
@@ -209,16 +214,29 @@ pub fn Gen.new_with_env_and_pref(files []ast.File, env &types.Environment, p &pr
 
 fn (mut g Gen) gen_file(file ast.File) {
 	g.set_file_module(file)
-	for stmt in file.stmts {
-		if !stmt_has_valid_data(stmt) {
+	mut global_indices := []int{}
+	mut fn_indices := []int{}
+	for i in 0 .. file.stmts.len {
+		stmt_ptr := &file.stmts[i]
+		// Collect top-level items first. Self-hosted cleanc can disturb the active
+		// stmt iteration state after the first emitted body in a file, so discovery
+		// and emission need to be split.
+		if (*stmt_ptr) is ast.GlobalDecl {
+			global_indices << i
 			continue
 		}
-		// Skip struct/enum/type/interface/const decls - already emitted in earlier passes
-		if stmt is ast.StructDecl || stmt is ast.EnumDecl || stmt is ast.TypeDecl
-			|| stmt is ast.ConstDecl || stmt is ast.InterfaceDecl {
-			continue
+		if (*stmt_ptr) is ast.FnDecl {
+			fn_indices << i
 		}
-		g.gen_stmt(stmt)
+	}
+	for gi in global_indices {
+		stmt_ptr := &file.stmts[gi]
+		g.gen_global_decl((*stmt_ptr) as ast.GlobalDecl)
+	}
+	for fi in fn_indices {
+		stmt_ptr := &file.stmts[fi]
+		fn_decl_ptr := &((*stmt_ptr) as ast.FnDecl)
+		g.gen_fn_decl_ptr(fn_decl_ptr)
 	}
 }
 
@@ -487,6 +505,7 @@ pub fn (mut g Gen) gen_passes_1_to_4() {
 	g.collect_typedef_c_types()
 	g.collect_module_type_names()
 	g.collect_runtime_aliases()
+	g.collect_generic_struct_bindings()
 	g.collect_fn_signatures()
 	g.collect_c_file_fn_keys()
 	g.collect_runtime_const_targets()
@@ -632,6 +651,12 @@ pub fn (mut g Gen) gen_passes_1_to_4() {
 				for field in stmt.fields {
 					_ = g.interface_method_info(field)
 				}
+				iface_c_name := if g.cur_module != '' && g.cur_module != 'builtin' {
+					'${g.cur_module}__${stmt.name}'
+				} else {
+					stmt.name
+				}
+				g.interface_decls[iface_c_name] = stmt
 				all_interfaces << InterfaceDeclInfo{
 					decl: stmt
 					mod:  g.cur_module
@@ -759,6 +784,7 @@ pub fn (mut g Gen) gen_passes_1_to_4() {
 	if g.tuple_aliases.len > 0 {
 		g.sb.writeln('')
 	}
+	g.emit_option_result_structs()
 	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
 		'pass 3.45 late tuple aliases')
 
@@ -812,21 +838,32 @@ pub fn (mut g Gen) gen_passes_1_to_4() {
 					continue
 				}
 				if stmt.language == .c && stmt.stmts.len == 0 {
+					// C extern declarations — their prototypes come from #include/#insert headers.
 					continue
 				}
 				if g.cur_module == 'eventbus' && stmt.is_method
-					&& stmt.name in ['subscribe_method', 'unsubscribe_method'] {
+					&& receiver_generic_param_names(stmt).len > 0 {
 					prev_generic_types := g.active_generic_types.clone()
 					string_types := {
 						'T': types.Type(types.string_)
 					}
 					g.active_generic_types = string_types.clone()
-					spec_name := g.specialized_fn_name(stmt, string_types)
-					if spec_name != '' {
-						g.gen_fn_head_with_name(stmt, spec_name)
-						g.sb.writeln(';')
-						g.active_generic_types = prev_generic_types.clone()
-						continue
+					if stmt.name in ['subscribe_method', 'unsubscribe_method'] {
+						spec_name := g.specialized_fn_name(stmt, string_types)
+						if spec_name != '' {
+							g.gen_fn_head_with_name(stmt, spec_name)
+							g.sb.writeln(';')
+							g.active_generic_types = prev_generic_types.clone()
+							continue
+						}
+					} else {
+						fn_name := g.get_fn_name(stmt)
+						if fn_name != '' {
+							g.gen_fn_head_with_name(stmt, fn_name)
+							g.sb.writeln(';')
+							g.active_generic_types = prev_generic_types.clone()
+							continue
+						}
 					}
 					g.active_generic_types = prev_generic_types.clone()
 				}
@@ -1127,6 +1164,7 @@ pub fn (g &Gen) new_pass5_worker(file_indices []int) &Gen {
 		map_aliases:                 g.map_aliases.clone()
 		result_aliases:              g.result_aliases.clone()
 		option_aliases:              g.option_aliases.clone()
+		alias_base_types:            g.alias_base_types.clone()
 		fixed_array_fields:          g.fixed_array_fields.clone()
 		fixed_array_field_elem:      g.fixed_array_field_elem.clone()
 		fixed_array_globals:         g.fixed_array_globals.clone()
@@ -1148,6 +1186,7 @@ pub fn (g &Gen) new_pass5_worker(file_indices []int) &Gen {
 		c_file_fn_keys:              g.c_file_fn_keys.clone()
 		global_var_modules:          g.global_var_modules.clone()
 		const_exprs:                 g.const_exprs.clone()
+		const_types:                 g.const_types.clone()
 		runtime_const_targets:       g.runtime_const_targets.clone()
 		used_fn_keys:                g.used_fn_keys.clone()
 		force_emit_fn_names:         g.force_emit_fn_names.clone()
@@ -1221,14 +1260,14 @@ fn (mut g Gen) emit_missing_runtime_fallbacks() {
 	if 'fn___at_least_one' !in g.emitted_types {
 		g.emitted_types['fn___at_least_one'] = true
 		g.sb.writeln('')
-		g.sb.writeln('u64 __at_least_one(u64 how_many) {')
+		g.sb.writeln('__attribute__((weak)) u64 __at_least_one(u64 how_many) {')
 		g.sb.writeln('\treturn how_many == 0 ? 1 : how_many;')
 		g.sb.writeln('}')
 	}
 	if 'fn_arguments' !in g.emitted_types {
 		g.emitted_types['fn_arguments'] = true
 		g.sb.writeln('')
-		g.sb.writeln('Array_string arguments() {')
+		g.sb.writeln('__attribute__((weak)) Array_string arguments() {')
 		g.sb.writeln('\tu8** argv = (u8**)g_main_argv;')
 		g.sb.writeln('\tArray_string res = __new_array_with_default_noscan(0, g_main_argc, sizeof(string), NULL);')
 		g.sb.writeln('\tfor (int i = 0; i < g_main_argc; i += 1) {')
@@ -1240,7 +1279,7 @@ fn (mut g Gen) emit_missing_runtime_fallbacks() {
 	if 'fn__write_buf_to_fd' !in g.emitted_types {
 		g.emitted_types['fn__write_buf_to_fd'] = true
 		g.sb.writeln('')
-		g.sb.writeln('void _write_buf_to_fd(int fd, u8* buf, int buf_len) {')
+		g.sb.writeln('__attribute__((weak)) void _write_buf_to_fd(int fd, u8* buf, int buf_len) {')
 		g.sb.writeln('\tif (buf_len <= 0) {')
 		g.sb.writeln('\t\treturn;')
 		g.sb.writeln('\t}')
@@ -1259,7 +1298,7 @@ fn (mut g Gen) emit_missing_runtime_fallbacks() {
 	if 'fn__writeln_to_fd' !in g.emitted_types {
 		g.emitted_types['fn__writeln_to_fd'] = true
 		g.sb.writeln('')
-		g.sb.writeln('void _writeln_to_fd(int fd, string s) {')
+		g.sb.writeln('__attribute__((weak)) void _writeln_to_fd(int fd, string s) {')
 		g.sb.writeln("\tu8 lf = '\\n';")
 		g.sb.writeln('\t_write_buf_to_fd(fd, s.str, s.len);')
 		g.sb.writeln('\t_write_buf_to_fd(fd, &lf, 1);')
@@ -1268,7 +1307,7 @@ fn (mut g Gen) emit_missing_runtime_fallbacks() {
 	if 'fn_Array_int_contains' !in g.emitted_types {
 		g.emitted_types['fn_Array_int_contains'] = true
 		g.sb.writeln('')
-		g.sb.writeln('bool Array_int_contains(Array_int a, int v) {')
+		g.sb.writeln('__attribute__((weak)) bool Array_int_contains(Array_int a, int v) {')
 		g.sb.writeln('\tfor (int i = 0; i < a.len; i += 1) {')
 		g.sb.writeln('\t\tif (*((int*)array__get(a, i)) == v) {')
 		g.sb.writeln('\t\t\treturn true;')
@@ -1280,7 +1319,7 @@ fn (mut g Gen) emit_missing_runtime_fallbacks() {
 	if 'fn_Array_string_contains' !in g.emitted_types {
 		g.emitted_types['fn_Array_string_contains'] = true
 		g.sb.writeln('')
-		g.sb.writeln('bool Array_string_contains(Array_string a, string v) {')
+		g.sb.writeln('__attribute__((weak)) bool Array_string_contains(Array_string a, string v) {')
 		g.sb.writeln('\tfor (int i = 0; i < a.len; i += 1) {')
 		g.sb.writeln('\t\tif (string__eq(*((string*)array__get(a, i)), v)) {')
 		g.sb.writeln('\t\t\treturn true;')
@@ -1292,7 +1331,7 @@ fn (mut g Gen) emit_missing_runtime_fallbacks() {
 	if 'fn_Array_string_index' !in g.emitted_types {
 		g.emitted_types['fn_Array_string_index'] = true
 		g.sb.writeln('')
-		g.sb.writeln('int Array_string_index(Array_string a, string v) {')
+		g.sb.writeln('__attribute__((weak)) int Array_string_index(Array_string a, string v) {')
 		g.sb.writeln('\tfor (int i = 0; i < a.len; i += 1) {')
 		g.sb.writeln('\t\tif (string__eq(*((string*)array__get(a, i)), v)) {')
 		g.sb.writeln('\t\t\treturn i;')
@@ -1304,7 +1343,7 @@ fn (mut g Gen) emit_missing_runtime_fallbacks() {
 	if 'fn_Array_int_str' !in g.emitted_types {
 		g.emitted_types['fn_Array_int_str'] = true
 		g.sb.writeln('')
-		g.sb.writeln('string Array_int_str(Array_int a) {')
+		g.sb.writeln('__attribute__((weak)) string Array_int_str(Array_int a) {')
 		g.sb.writeln('\tstrings__Builder sb = strings__new_builder(32);')
 		g.sb.writeln('\tstrings__Builder__write_string(&sb, (string){.str = "[", .len = 1, .is_lit = 1});')
 		g.sb.writeln('\tfor (int i = 0; i < a.len; i += 1) {')
@@ -1320,7 +1359,7 @@ fn (mut g Gen) emit_missing_runtime_fallbacks() {
 	if 'fn_DenseArray__zeros_to_end' !in g.emitted_types {
 		g.emitted_types['fn_DenseArray__zeros_to_end'] = true
 		g.sb.writeln('')
-		g.sb.writeln('void DenseArray__zeros_to_end(DenseArray* d) {')
+		g.sb.writeln('__attribute__((weak)) void DenseArray__zeros_to_end(DenseArray* d) {')
 		g.sb.writeln('\tvoid* tmp_value = malloc(d->value_bytes);')
 		g.sb.writeln('\tvoid* tmp_key = malloc(d->key_bytes);')
 		g.sb.writeln('\tint count = 0;')
@@ -1351,7 +1390,7 @@ fn (mut g Gen) emit_missing_runtime_fallbacks() {
 	if 'fn___sort_cmp_int_asc' !in g.emitted_types {
 		g.emitted_types['fn___sort_cmp_int_asc'] = true
 		g.sb.writeln('')
-		g.sb.writeln('int __sort_cmp_int_asc(int* a, int* b) {')
+		g.sb.writeln('__attribute__((weak)) int __sort_cmp_int_asc(int* a, int* b) {')
 		g.sb.writeln('\tif (*a < *b) return -1;')
 		g.sb.writeln('\tif (*a > *b) return 1;')
 		g.sb.writeln('\treturn 0;')
@@ -1360,10 +1399,119 @@ fn (mut g Gen) emit_missing_runtime_fallbacks() {
 	if 'fn___sort_cmp_RepIndex_by_idx_asc' !in g.emitted_types {
 		g.emitted_types['fn___sort_cmp_RepIndex_by_idx_asc'] = true
 		g.sb.writeln('')
-		g.sb.writeln('int __sort_cmp_RepIndex_by_idx_asc(RepIndex* a, RepIndex* b) {')
+		g.sb.writeln('__attribute__((weak)) int __sort_cmp_RepIndex_by_idx_asc(RepIndex* a, RepIndex* b) {')
 		g.sb.writeln('\tif (a->idx < b->idx) return -1;')
 		g.sb.writeln('\tif (a->idx > b->idx) return 1;')
 		g.sb.writeln('\treturn 0;')
+		g.sb.writeln('}')
+	}
+	if 'fn_bits__leading_zeros_64' !in g.emitted_types {
+		g.emitted_types['fn_bits__leading_zeros_64'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) int bits__leading_zeros_64(u64 x) {')
+		g.sb.writeln('\tif (x == 0) {')
+		g.sb.writeln('\t\treturn 64;')
+		g.sb.writeln('\t}')
+		g.sb.writeln('\treturn __builtin_clzll(x);')
+		g.sb.writeln('}')
+	}
+	if 'fn_bits__trailing_zeros_32' !in g.emitted_types {
+		g.emitted_types['fn_bits__trailing_zeros_32'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) int bits__trailing_zeros_32(u32 x) {')
+		g.sb.writeln('\tif (x == 0) {')
+		g.sb.writeln('\t\treturn 32;')
+		g.sb.writeln('\t}')
+		g.sb.writeln('\treturn __builtin_ctz(x);')
+		g.sb.writeln('}')
+	}
+	if 'fn_bits__trailing_zeros_64' !in g.emitted_types {
+		g.emitted_types['fn_bits__trailing_zeros_64'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) int bits__trailing_zeros_64(u64 x) {')
+		g.sb.writeln('\tif (x == 0) {')
+		g.sb.writeln('\t\treturn 64;')
+		g.sb.writeln('\t}')
+		g.sb.writeln('\treturn __builtin_ctzll(x);')
+		g.sb.writeln('}')
+	}
+	if 'fn_bits__rotate_left_32' !in g.emitted_types {
+		g.emitted_types['fn_bits__rotate_left_32'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) u32 bits__rotate_left_32(u32 x, int k) {')
+		g.sb.writeln('\tu32 s = ((u32)k) & 31;')
+		g.sb.writeln('\treturn (x << s) | (x >> ((32 - s) & 31));')
+		g.sb.writeln('}')
+	}
+	if 'fn_eprint' !in g.emitted_types {
+		g.emitted_types['fn_eprint'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) void eprint(string s) {')
+		g.sb.writeln('\tflush_stdout();')
+		g.sb.writeln('\tflush_stderr();')
+		g.sb.writeln('\t_write_buf_to_fd(2, s.str, s.len);')
+		g.sb.writeln('\tflush_stderr();')
+		g.sb.writeln('}')
+	}
+	if 'fn_flush_stdout' !in g.emitted_types {
+		g.emitted_types['fn_flush_stdout'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) void flush_stdout() {')
+		g.sb.writeln('\tfflush(stdout);')
+		g.sb.writeln('}')
+	}
+	if 'fn_flush_stderr' !in g.emitted_types {
+		g.emitted_types['fn_flush_stderr'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) void flush_stderr() {')
+		g.sb.writeln('\tfflush(stderr);')
+		g.sb.writeln('}')
+	}
+	if 'fn_malloc_noscan' !in g.emitted_types {
+		g.emitted_types['fn_malloc_noscan'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) u8* malloc_noscan(isize n) {')
+		g.sb.writeln('\treturn malloc(n);')
+		g.sb.writeln('}')
+	}
+	if 'fn_memdup' !in g.emitted_types {
+		g.emitted_types['fn_memdup'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) void* memdup(void* src, isize sz) {')
+		g.sb.writeln('\tif (sz <= 0) {')
+		g.sb.writeln('\t\treturn NULL;')
+		g.sb.writeln('\t}')
+		g.sb.writeln('\tvoid* res = malloc_noscan(sz);')
+		g.sb.writeln('\tmemcpy(res, src, sz);')
+		g.sb.writeln('\treturn res;')
+		g.sb.writeln('}')
+	}
+	if 'fn_f64_abs' !in g.emitted_types {
+		g.emitted_types['fn_f64_abs'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) f64 f64_abs(f64 a) {')
+		g.sb.writeln('\treturn a < 0 ? -a : a;')
+		g.sb.writeln('}')
+	}
+	if 'fn_f64__strg' !in g.emitted_types {
+		g.emitted_types['fn_f64__strg'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) string f64__strg(f64 x) {')
+		g.sb.writeln('\treturn f64__str(x);')
+		g.sb.writeln('}')
+	}
+	if 'fn_f32__str' !in g.emitted_types {
+		g.emitted_types['fn_f32__str'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) string f32__str(f32 x) {')
+		g.sb.writeln('\treturn f64__str((f64)x);')
+		g.sb.writeln('}')
+	}
+	if 'fn_f32__strg' !in g.emitted_types {
+		g.emitted_types['fn_f32__strg'] = true
+		g.sb.writeln('')
+		g.sb.writeln('__attribute__((weak)) string f32__strg(f32 x) {')
+		g.sb.writeln('\treturn f64__strg((f64)x);')
 		g.sb.writeln('}')
 	}
 }

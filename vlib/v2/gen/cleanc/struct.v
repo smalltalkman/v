@@ -7,6 +7,184 @@ module cleanc
 import v2.ast
 import v2.types
 
+// collect_generic_struct_bindings scans all struct fields for GenericType
+// instantiations (e.g. LinkedList[ValueInfo]) and records the concrete type
+// bindings so that methods on generic structs can resolve their generic params.
+fn (mut g Gen) collect_generic_struct_bindings() {
+	for file in g.files {
+		g.set_file_module(file)
+		for stmt in file.stmts {
+			if stmt is ast.StructDecl {
+				for field in stmt.fields {
+					g.scan_expr_for_generic_types(field.typ)
+				}
+			}
+		}
+	}
+	// Propagation pass: for each generic struct with recorded bindings,
+	// look for nested generic type references (e.g. Node[T] inside
+	// LinkedList[T]) and record concrete bindings by substituting the
+	// parent struct's known bindings for placeholder params.
+	for file in g.files {
+		g.set_file_module(file)
+		for stmt in file.stmts {
+			if stmt is ast.StructDecl {
+				if stmt.generic_params.len == 0 {
+					continue
+				}
+				struct_c_name := g.get_struct_name(stmt)
+				if struct_c_name !in g.generic_struct_bindings {
+					continue
+				}
+				parent_bindings := g.generic_struct_bindings[struct_c_name].clone()
+				for field in stmt.fields {
+					g.propagate_generic_bindings(field.typ, parent_bindings)
+				}
+			}
+		}
+	}
+}
+
+// propagate_generic_bindings finds nested generic type references and records
+// concrete bindings by substituting placeholder params from parent bindings.
+fn (mut g Gen) propagate_generic_bindings(e ast.Expr, parent_bindings map[string]types.Type) {
+	match e {
+		ast.Type {
+			if e is ast.GenericType {
+				gt := e as ast.GenericType
+				base_name := g.expr_type_to_c(gt.name)
+				if gt.params.len > 0 {
+					// Check if any param is a placeholder that can be resolved
+					// via parent_bindings.
+					mut all_concrete := true
+					for param in gt.params {
+						pname := param.name()
+						if is_generic_placeholder_type_name(pname) && pname !in parent_bindings {
+							all_concrete = false
+							break
+						}
+					}
+					if all_concrete && base_name !in g.generic_struct_bindings {
+						struct_base := if base_name.contains('__') {
+							base_name.all_after_last('__')
+						} else {
+							base_name
+						}
+						g.record_generic_struct_bindings_with_parent(struct_base, base_name,
+							gt.params, parent_bindings)
+					}
+				}
+				// Recurse into params
+				for param in gt.params {
+					g.propagate_generic_bindings(param, parent_bindings)
+				}
+			}
+		}
+		ast.PrefixExpr {
+			g.propagate_generic_bindings(e.expr, parent_bindings)
+		}
+		ast.GenericArgOrIndexExpr {
+			base_name := g.expr_type_to_c(e.lhs)
+			arg_name := e.expr.name()
+			if base_name !in g.generic_struct_bindings {
+				if is_generic_placeholder_type_name(arg_name) && arg_name in parent_bindings {
+					struct_base := if base_name.contains('__') {
+						base_name.all_after_last('__')
+					} else {
+						base_name
+					}
+					g.record_generic_struct_bindings_with_parent(struct_base, base_name,
+						[e.expr], parent_bindings)
+				} else if !is_generic_placeholder_type_name(arg_name) {
+					struct_base := if base_name.contains('__') {
+						base_name.all_after_last('__')
+					} else {
+						base_name
+					}
+					g.record_generic_struct_bindings(struct_base, base_name, [e.expr])
+				}
+			}
+		}
+		ast.GenericArgs {
+			base_name := g.expr_type_to_c(e.lhs)
+			if base_name !in g.generic_struct_bindings && e.args.len > 0 {
+				struct_base := if base_name.contains('__') {
+					base_name.all_after_last('__')
+				} else {
+					base_name
+				}
+				g.record_generic_struct_bindings_with_parent(struct_base, base_name,
+					e.args, parent_bindings)
+			}
+		}
+		else {}
+	}
+}
+
+fn (mut g Gen) scan_expr_for_generic_types(e ast.Expr) {
+	match e {
+		ast.Type {
+			if e is ast.GenericType {
+				gt := e as ast.GenericType
+				base_name := g.expr_type_to_c(gt.name)
+				if gt.params.len > 0 {
+					struct_base := if base_name.contains('__') {
+						base_name.all_after_last('__')
+					} else {
+						base_name
+					}
+					g.record_generic_struct_bindings(struct_base, base_name, gt.params)
+				}
+				// Also scan params recursively (e.g. Node[T] inside LinkedList[ValueInfo])
+				for param in gt.params {
+					g.scan_expr_for_generic_types(param)
+				}
+			}
+			if e is ast.ArrayType {
+				g.scan_expr_for_generic_types(e.elem_type)
+			}
+			if e is ast.MapType {
+				g.scan_expr_for_generic_types(e.key_type)
+				g.scan_expr_for_generic_types(e.value_type)
+			}
+			if e is ast.OptionType {
+				g.scan_expr_for_generic_types(e.base_type)
+			}
+			if e is ast.ResultType {
+				g.scan_expr_for_generic_types(e.base_type)
+			}
+		}
+		ast.PrefixExpr {
+			g.scan_expr_for_generic_types(e.expr)
+		}
+		ast.GenericArgOrIndexExpr {
+			// e.g. &Node[ValueInfo] → PrefixExpr { GenericArgOrIndexExpr { Ident("Node"), Ident("ValueInfo") } }
+			base_name := g.expr_type_to_c(e.lhs)
+			arg_name := e.expr.name()
+			if !is_generic_placeholder_type_name(arg_name) {
+				struct_base := if base_name.contains('__') {
+					base_name.all_after_last('__')
+				} else {
+					base_name
+				}
+				g.record_generic_struct_bindings(struct_base, base_name, [e.expr])
+			}
+		}
+		ast.GenericArgs {
+			base_name := g.expr_type_to_c(e.lhs)
+			if e.args.len > 0 {
+				struct_base := if base_name.contains('__') {
+					base_name.all_after_last('__')
+				} else {
+					base_name
+				}
+				g.record_generic_struct_bindings(struct_base, base_name, e.args)
+			}
+		}
+		else {}
+	}
+}
+
 fn (mut g Gen) struct_is_leaf(node ast.StructDecl) bool {
 	if node.embedded.len > 0 {
 		return false
@@ -95,6 +273,11 @@ fn (g &Gen) struct_leaf_pointer_type(t types.Type) bool {
 
 fn (mut g Gen) emit_ready_option_result_structs() bool {
 	mut emitted_any := false
+	for _, ret_type in g.fn_return_types {
+		if ret_type.starts_with('_option_') || ret_type.starts_with('_result_') {
+			g.register_alias_type(ret_type)
+		}
+	}
 	mut option_names := g.option_aliases.keys()
 	option_names.sort()
 	for name in option_names {
@@ -264,17 +447,22 @@ fn (mut g Gen) gen_struct_decl(node ast.StructDecl) {
 	if node.language == .c {
 		return
 	}
-	// Generic structs are emitted using the first concrete binding seen for each
-	// placeholder in the current compile.
+	// Generic structs are emitted using concrete bindings recorded from
+	// GenericType instantiations, falling back to the first binding in env.
+	prev_generic_types := g.active_generic_types.clone()
 	if node.generic_params.len > 0 {
-		bindings := g.fallback_generic_bindings_for_names(generic_param_names(node.generic_params)) or {
-			return
+		struct_c_name := g.get_struct_name(node)
+		bindings := if struct_c_name in g.generic_struct_bindings {
+			g.generic_struct_bindings[struct_c_name].clone()
+		} else {
+			g.fallback_generic_bindings_for_names(generic_param_names(node.generic_params)) or {
+				return
+			}
 		}
-		prev_generic_types := g.active_generic_types.clone()
 		g.active_generic_types = bindings.clone()
-		defer {
-			g.active_generic_types = prev_generic_types.clone()
-		}
+	}
+	defer {
+		g.active_generic_types = prev_generic_types.clone()
 	}
 
 	name := g.get_struct_name(node)
@@ -299,7 +487,25 @@ fn (mut g Gen) gen_struct_decl(node ast.StructDecl) {
 		}
 		g.sb.writeln('\t${emb_type} ${emb_field_name};')
 		if i < env_struct.embedded.len {
-			embedded := env_struct.embedded[i]
+			mut embedded := env_struct.embedded[i]
+			// For unions, the checker stores placeholder Struct objects with empty
+			// fields. Look up the actual struct type from the environment,
+			// following alias chains across modules.
+			if embedded.fields.len == 0 && node.is_union {
+				if embedded.name != '' {
+					resolved := g.lookup_union_variant_struct(embedded.name)
+					if resolved.fields.len > 0 {
+						embedded = resolved
+					}
+				}
+				if embedded.fields.len == 0 {
+					// Try with the C type name from the AST
+					resolved2 := g.lookup_union_variant_struct(emb_type)
+					if resolved2.fields.len > 0 {
+						embedded = resolved2
+					}
+				}
+			}
 			for ef in embedded.fields {
 				key := name + '.' + ef.name
 				g.embedded_field_owner[key] = emb_field_name
@@ -360,6 +566,22 @@ fn (mut g Gen) gen_struct_decl(node ast.StructDecl) {
 		}
 		field_type := field_lookup_type
 		g.sb.writeln('\t${field_type} ${field_name};')
+		// For union types, register the variant's sub-fields in embedded_field_owner
+		// so that `box.x` resolves to `box.GgRect.x` via embedded_owner_for().
+		if node.is_union {
+			variant_struct := g.lookup_union_variant_struct(field_lookup_type)
+			for vf in variant_struct.fields {
+				vf_key := name + '.' + vf.name
+				g.embedded_field_owner[vf_key] = field_name
+				vf_type := g.types_type_to_c(vf.typ)
+				g.struct_field_types[vf_key] = vf_type
+				if name.contains('__') {
+					vf_short_key := name.all_after_last('__') + '.' + vf.name
+					g.embedded_field_owner[vf_short_key] = field_name
+					g.struct_field_types[vf_short_key] = vf_type
+				}
+			}
+		}
 	}
 	// Add mutex field for shared fields
 	if has_shared_fields {
@@ -744,7 +966,7 @@ fn (mut g Gen) gen_sum_variant_field_selector(node ast.SelectorExpr) bool {
 	return true
 }
 
-fn (g &Gen) embedded_owner_for(struct_name string, field_name string) string {
+fn (mut g Gen) embedded_owner_for(struct_name string, field_name string) string {
 	if struct_name == '' {
 		return ''
 	}
@@ -757,6 +979,9 @@ fn (g &Gen) embedded_owner_for(struct_name string, field_name string) string {
 		if owner := g.embedded_field_owner[short_key] {
 			return owner
 		}
+	}
+	if info := g.lookup_embedded_field_info(struct_name, field_name) {
+		return info.owner
 	}
 	return ''
 }
@@ -929,11 +1154,67 @@ fn (mut g Gen) init_field_expected_type(type_name string, env_struct types.Struc
 			return g.types_type_to_c(field.typ)
 		}
 	}
+	if info := g.lookup_embedded_field_info(type_name, field_name) {
+		if info.field_type != '' {
+			return info.field_type
+		}
+	}
 	return ''
+}
+
+fn (mut g Gen) gen_channel_init_expr(node ast.InitExpr) bool {
+	mut is_channel := false
+	mut elem_c_type := ''
+	if node.typ is ast.Type && node.typ is ast.ChannelType {
+		is_channel = true
+		ch_type := node.typ as ast.ChannelType
+		elem_c_type = g.expr_type_to_c(ch_type.elem_type)
+	}
+	if raw_type := g.get_raw_type(node.typ) {
+		unwrapped := unwrap_alias_type(raw_type)
+		if unwrapped is types.Channel {
+			is_channel = true
+			if elem_type := unwrapped.elem_type {
+				elem_c_type = g.types_type_to_c(elem_type)
+			}
+		}
+	}
+	if !is_channel && g.expr_type_to_c(node.typ) != 'chan' {
+		return false
+	}
+	if elem_c_type == '' {
+		elem_c_type = 'void*'
+	}
+	g.force_emit_fn_names['sync__new_channel_st'] = true
+	g.called_fn_names['sync__new_channel_st'] = true
+	g.sb.write_string('sync__new_channel_st(')
+	mut wrote_cap := false
+	for field in node.fields {
+		if field.name == 'cap' {
+			g.expr(field.value)
+			wrote_cap = true
+			break
+		}
+	}
+	if !wrote_cap && node.typ is ast.Type && node.typ is ast.ChannelType {
+		ch_type := node.typ as ast.ChannelType
+		if ch_type.cap !is ast.EmptyExpr {
+			g.expr(ch_type.cap)
+			wrote_cap = true
+		}
+	}
+	if !wrote_cap {
+		g.sb.write_string('0')
+	}
+	g.sb.write_string(', sizeof(${elem_c_type}) > 0 ? sizeof(${elem_c_type}) : 1)')
+	return true
 }
 
 fn (mut g Gen) gen_init_expr(node ast.InitExpr) {
 	type_name := g.expr_type_to_c(node.typ)
+	if g.gen_channel_init_expr(node) {
+		return
+	}
 	mut env_struct := types.Struct{}
 	mut has_struct_defaults := false
 	if raw_type := g.get_raw_type(node.typ) {

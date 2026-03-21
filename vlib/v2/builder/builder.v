@@ -814,11 +814,16 @@ fn (mut b Builder) gen_cleanc_source_with_cache_init_calls(modules []string, cac
 }
 
 fn (mut b Builder) gen_cleanc_source_with_options(modules []string, export_const_symbols bool, cache_bundle_name string, cached_init_calls []string, use_markused bool) string {
-	mut gen_files := b.files.clone()
+	mut gen_files := []ast.File{cap: b.files.len}
+	for file in b.files {
+		gen_files << file
+	}
 	if cached_init_calls.len > 0 && b.used_vh_for_parse {
 		mut p := parser.Parser.new(b.pref)
 		header_files := p.parse_files(b.core_cached_parse_paths(), mut b.file_set)
-		gen_files << header_files
+		for header_file in header_files {
+			gen_files << header_file
+		}
 	}
 	mut gen := cleanc.Gen.new_with_env_and_pref(gen_files, b.env, b.pref)
 	if modules.len > 0 {
@@ -1299,14 +1304,13 @@ fn resolve_flag_path(path string, file_dir string, vmod_root string) string {
 	if os.is_abs_path(resolved) {
 		return resolved
 	}
-	if resolved.starts_with('./') || resolved.starts_with('../') {
-		return os.norm_path(os.join_path(file_dir, resolved))
-	}
-	return resolved
+	// Resolve any relative path (including bare relative like 'r/qrcodegen')
+	// relative to the source file's directory, matching V1 behavior
+	return os.norm_path(os.join_path(file_dir, resolved))
 }
 
 fn normalize_flag_value_for_file(flag_value string, file_path string) string {
-	file_dir := os.dir(file_path)
+	file_dir := os.dir(os.real_path(file_path))
 	vmod_root := find_vmod_root_for_file(file_path)
 	mut tokens := flag_value.fields()
 	mut out := []string{}
@@ -1334,7 +1338,8 @@ fn normalize_flag_value_for_file(flag_value string, file_path string) string {
 			i++
 			continue
 		}
-		if tok.contains('@VMODROOT') || tok.starts_with('./') || tok.starts_with('../')
+		if tok.contains('@VMODROOT') || tok.contains('@VEXEROOT')
+			|| tok.starts_with('./') || tok.starts_with('../')
 			|| tok.ends_with('.c') || tok.ends_with('.m') || tok.ends_with('.o') {
 			out << resolve_flag_path(tok, file_dir, vmod_root)
 			i++
@@ -1467,8 +1472,9 @@ fn (b &Builder) collect_cflags_from_sources() string {
 			if skip_depth > 0 {
 				continue
 			}
-			mut flag := parse_flag_directive_line(line, scan_path) or { continue }
-			flag = flag.replace('@VEXEROOT', b.pref.vroot).replace('VEXEROOT', b.pref.vroot)
+			// Replace @VEXEROOT before parsing so path normalization sees absolute paths
+			resolved_line := line.replace('@VEXEROOT', b.pref.vroot).replace('VEXEROOT', b.pref.vroot)
+			mut flag := parse_flag_directive_line(resolved_line, scan_path) or { continue }
 			if flag_references_missing_file(flag) {
 				continue
 			}

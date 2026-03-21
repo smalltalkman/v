@@ -179,11 +179,13 @@ fn (mut g Gen) emit_directive(stmt ast.Directive, file_name string, mut seen map
 		return
 	}
 	if name !in ['include', 'define', 'undef', 'ifdef', 'ifndef', 'if', 'elif', 'else', 'endif',
-		'pragma'] {
+		'pragma', 'insert'] {
 		return
 	}
+	// #insert is V's directive to inline a file; for C backend, emit as #include.
+	emit_name := if name == 'insert' { 'include' } else { name }
 	// Skip includes with corrupt paths (ARM64 backend may corrupt string data)
-	if name == 'include' {
+	if emit_name == 'include' {
 		v := stmt.value.trim_space()
 		if v.len > 0 && !v.contains('/') && !v.contains('.') && !v.starts_with('"')
 			&& !v.starts_with('<') {
@@ -191,15 +193,15 @@ fn (mut g Gen) emit_directive(stmt ast.Directive, file_name string, mut seen map
 		}
 	}
 	vroot := if g.pref != unsafe { nil } { g.pref.vroot } else { '' }
-	value := normalize_c_directive_value(name, stmt.value, file_name, vroot)
-	line := if value == '' { '#${name}' } else { '#${name} ${value}' }
+	value := normalize_c_directive_value(emit_name, stmt.value, file_name, vroot)
+	line := if value == '' { '#${emit_name}' } else { '#${emit_name} ${value}' }
 	if line in seen {
 		return
 	}
 	seen[line] = true
 	// Defer .m (Objective-C) includes until after type definitions,
 	// because they reference V-generated C types like gg__Color, string, etc.
-	if name == 'include' && (value.contains('.m"') || value.contains(".m'")) {
+	if emit_name == 'include' && (value.contains('.m"') || value.contains(".m'")) {
 		g.deferred_m_includes << line
 		return
 	}

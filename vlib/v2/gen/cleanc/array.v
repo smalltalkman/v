@@ -12,6 +12,11 @@ fn array_alias_elem_type(arr_type string) string {
 	if base.starts_with('Array_') {
 		return unmangle_c_ptr_type(base['Array_'.len..])
 	}
+	if base.starts_with('Array_fixed_') {
+		without_prefix := base['Array_fixed_'.len..]
+		last_underscore := without_prefix.last_index('_') or { return '' }
+		return unmangle_c_ptr_type(without_prefix[..last_underscore])
+	}
 	if base in ['strings__Builder', 'Builder'] {
 		return 'u8'
 	}
@@ -329,10 +334,60 @@ fn (mut g Gen) expr_array_runtime_type(expr ast.Expr) string {
 // array_elem_type_from_expr resolves the element type of an array expression
 // using the types.Environment.
 fn (mut g Gen) infer_array_elem_type_from_expr(arr_expr ast.Expr) string {
+	match arr_expr {
+		ast.ModifierExpr {
+			return g.infer_array_elem_type_from_expr(arr_expr.expr)
+		}
+		ast.ParenExpr {
+			return g.infer_array_elem_type_from_expr(arr_expr.expr)
+		}
+		ast.PrefixExpr {
+			if arr_expr.op in [.amp, .mul] {
+				return g.infer_array_elem_type_from_expr(arr_expr.expr)
+			}
+		}
+		ast.CastExpr {
+			return g.infer_array_elem_type_from_expr(arr_expr.expr)
+		}
+		ast.AsCastExpr {
+			return g.infer_array_elem_type_from_expr(arr_expr.expr)
+		}
+		else {}
+	}
+	if arr_expr is ast.ArrayInitExpr {
+		elem_type := g.extract_array_elem_type(arr_expr.typ)
+		if elem_type != '' {
+			return elem_type
+		}
+		if arr_expr.exprs.len > 0 {
+			first_expr_type := g.get_expr_type(arr_expr.exprs[0])
+			if first_expr_type != '' && first_expr_type != 'int' && first_expr_type != 'int_literal' {
+				return first_expr_type
+			}
+		}
+	}
 	// For slice calls, the return type is generic `array`; resolve from the source array.
 	if arr_expr is ast.CallExpr {
 		if arr_expr.lhs is ast.Ident {
 			fn_name := sanitize_fn_ident(arr_expr.lhs.name)
+			if fn_name in ['new_array_from_c_array', 'builtin__new_array_from_c_array', 'builtin__new_array_from_c_array_noscan']
+				&& arr_expr.args.len > 3 {
+				return g.infer_array_elem_type_from_expr(arr_expr.args[3])
+			}
+			// __new_array_with_default_noscan(len, cap, sizeof(T), default)
+			// arg[2] is sizeof(T) — extract T from the KeywordOperator
+			if fn_name in ['__new_array_with_default_noscan', '__new_array_with_default',
+				'builtin____new_array_with_default_noscan', 'builtin____new_array_with_default']
+				&& arr_expr.args.len >= 3 {
+				sizeof_arg := arr_expr.args[2]
+				if sizeof_arg is ast.KeywordOperator && sizeof_arg.op == .key_sizeof
+					&& sizeof_arg.exprs.len > 0 {
+					t := g.expr_type_to_c(sizeof_arg.exprs[0])
+					if t != '' && t != 'int' {
+						return t
+					}
+				}
+			}
 			if fn_name in ['array__slice', 'array__slice_ni']
 				|| (fn_name.starts_with('Array_') && (fn_name.ends_with('__slice')
 				|| fn_name.ends_with('__slice_ni'))) {
@@ -506,12 +561,17 @@ fn (mut g Gen) gen_array_init_expr(node ast.ArrayInitExpr) {
 		if final_elem != '' && is_dyn {
 			// Dynamic array compound literal: (elem_type[N]){e1, e2, ...}
 			g.sb.write_string('(${final_elem}[${node.exprs.len}]){')
+			is_iface_elem := g.is_interface_type(final_elem)
 			for i in 0 .. node.exprs.len {
 				e := node.exprs[i]
 				if i > 0 {
 					g.sb.write_string(', ')
 				}
-				g.expr(e)
+				if is_iface_elem && g.gen_interface_cast(final_elem, e) {
+					// interface wrapping handled
+				} else {
+					g.expr(e)
+				}
 			}
 			g.sb.write_string('}')
 			return
