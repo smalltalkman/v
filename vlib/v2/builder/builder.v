@@ -1547,9 +1547,19 @@ fn split_compile_and_link_flags(flags string) (string, string) {
 			}
 		} else if tok.starts_with('-l') || tok.starts_with('-L') {
 			link << tok
+			// -L or -l alone (space-separated from its argument): grab the next token
+			if (tok == '-L' || tok == '-l') && i + 1 < tokens.len {
+				i++
+				link << tokens[i]
+			}
 		} else if tok.ends_with('.o') || tok.ends_with('.obj') || tok.ends_with('.a')
 			|| tok.ends_with('.so') || tok.ends_with('.dylib') {
 			link << tok
+		} else if tok == '-I' && i + 1 < tokens.len {
+			// -I alone (space-separated from its argument): grab the next token
+			compile << tok
+			i++
+			compile << tokens[i]
 		} else {
 			compile << tok
 		}

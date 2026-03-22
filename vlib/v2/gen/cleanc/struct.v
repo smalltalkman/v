@@ -1469,6 +1469,36 @@ fn (mut g Gen) should_deref_init_field_value(struct_type string, field_name stri
 		return false
 	}
 	mut value_type := g.get_expr_type(value)
+	// When the value is a SelectorExpr with .data on a result/option variable
+	// (e.g., _or_t48.data where _or_t48 is _result_SomeTypeptr), the generated
+	// C code extracts the pointer from the result data area. The V-level type
+	// says SomeType (non-pointer), but the actual C output is SomeType*.
+	if !is_type_name_pointer_like(value_type) && value is ast.SelectorExpr {
+		sel := value as ast.SelectorExpr
+		if sel.rhs.name == 'data' {
+			lhs_type := g.get_expr_type(sel.lhs)
+			if lhs_type.starts_with('_result_') {
+				inner := g.result_value_type(lhs_type)
+				if is_type_name_pointer_like(inner) {
+					value_type = inner
+				}
+			} else if lhs_type.starts_with('_option_') {
+				inner := option_value_type(lhs_type)
+				if is_type_name_pointer_like(inner) {
+					value_type = inner
+				}
+			}
+		}
+	}
+	// When the value is a CastExpr whose target type is a pointer (e.g., from
+	// result/option unwrap like `new_socket()!` producing `&Socket`), the generated
+	// C code will yield a pointer.
+	if !is_type_name_pointer_like(value_type) && value is ast.CastExpr {
+		cast_type := g.expr_type_to_c((value as ast.CastExpr).typ)
+		if is_type_name_pointer_like(cast_type) {
+			value_type = cast_type
+		}
+	}
 	if !is_type_name_pointer_like(value_type) {
 		call_ret_type := g.expr_pointer_return_type(value)
 		if call_ret_type != '' {
