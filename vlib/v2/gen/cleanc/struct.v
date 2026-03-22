@@ -1283,7 +1283,7 @@ fn (mut g Gen) gen_init_expr(node ast.InitExpr) {
 		}
 	}
 	if node.fields.len == 0 {
-		if has_struct_defaults && env_struct.fields.len > 0 {
+		if has_struct_defaults && (env_struct.fields.len > 0 || env_struct.embedded.len > 0) {
 			mut wrote_defaults := 0
 			g.sb.write_string('((${type_name}){')
 			for field in env_struct.fields {
@@ -1298,6 +1298,22 @@ fn (mut g Gen) gen_init_expr(node ast.InitExpr) {
 					g.sb.write_string('0')
 				}
 				wrote_defaults++
+			}
+			for emb in env_struct.embedded {
+				emb_name := emb.name.all_after_last('__')
+				for field in emb.fields {
+					if !struct_field_needs_explicit_default(field) {
+						continue
+					}
+					if wrote_defaults > 0 {
+						g.sb.write_string(',')
+					}
+					g.sb.write_string('.${escape_c_keyword(emb_name)}.${escape_c_keyword(field.name)} = ')
+					if !g.write_struct_field_default_value(field) {
+						g.sb.write_string('0')
+					}
+					wrote_defaults++
+				}
 			}
 			if wrote_defaults == 0 {
 				g.sb.write_string('0')
@@ -1452,6 +1468,26 @@ fn (mut g Gen) gen_init_expr(node ast.InitExpr) {
 				g.sb.write_string('0')
 			}
 			wrote_fields++
+		}
+		// Also fill defaults for fields from embedded structs.
+		for emb in env_struct.embedded {
+			emb_name := emb.name.all_after_last('__')
+			for field in emb.fields {
+				if initialized_fields[field.name] {
+					continue
+				}
+				if !struct_field_needs_explicit_default(field) {
+					continue
+				}
+				if wrote_fields > 0 {
+					g.sb.write_string(',')
+				}
+				g.sb.write_string('.${escape_c_keyword(emb_name)}.${escape_c_keyword(field.name)} = ')
+				if !g.write_struct_field_default_value(field) {
+					g.sb.write_string('0')
+				}
+				wrote_fields++
+			}
 		}
 	}
 	g.sb.write_string('})')

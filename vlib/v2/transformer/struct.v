@@ -1454,6 +1454,77 @@ fn (mut t Transformer) add_missing_struct_field_defaults(struct_name string, fie
 			}
 		}
 	}
+	// Also fill defaults for fields from embedded structs.
+	for emb in struct_info.embedded {
+		for struct_field in emb.fields {
+			if struct_field.name in existing {
+				continue
+			}
+			if struct_field.default_expr !is ast.EmptyExpr
+				&& t.is_supported_struct_default_expr(struct_field.default_expr) {
+				mut emb_struct_name := struct_name
+				if emb.name.contains('__') {
+					emb_struct_name = emb.name
+				}
+				resolved_default := t.resolve_expr_with_expected_type(struct_field.default_expr,
+					struct_field.typ)
+				out << ast.FieldInit{
+					name:  struct_field.name
+					value: t.transform_struct_field_default_expr(emb_struct_name, resolved_default)
+				}
+				continue
+			}
+			field_type := t.unwrap_alias_and_pointer_type(struct_field.typ)
+			if field_type is types.Map {
+				map_init := ast.Expr(ast.MapInitExpr{
+					typ: t.type_to_ast_type_expr(field_type)
+				})
+				out << ast.FieldInit{
+					name:  struct_field.name
+					value: t.transform_expr(map_init)
+				}
+				continue
+			}
+			if field_type is types.Array {
+				array_init := ast.Expr(ast.ArrayInitExpr{
+					typ: t.type_to_ast_type_expr(field_type)
+				})
+				out << ast.FieldInit{
+					name:  struct_field.name
+					value: t.transform_expr(array_init)
+				}
+				continue
+			}
+			if field_type is types.OptionType {
+				option_none := ast.Expr(ast.InitExpr{
+					typ:    t.type_to_ast_type_expr(field_type)
+					fields: [
+						ast.FieldInit{
+							name:  'state'
+							value: ast.BasicLiteral{
+								kind:  token.Token.number
+								value: '2'
+							}
+						},
+					]
+				})
+				out << ast.FieldInit{
+					name:  struct_field.name
+					value: t.transform_expr(option_none)
+				}
+				continue
+			}
+			if field_type is types.String {
+				out << ast.FieldInit{
+					name:  struct_field.name
+					value: ast.StringLiteral{
+						kind:  .v
+						value: "''"
+					}
+				}
+			}
+		}
+	}
 	return out
 }
 
