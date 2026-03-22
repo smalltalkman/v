@@ -1558,8 +1558,7 @@ fn (mut g Gen) expr(node ast.Expr) {
 			} else if node.name == '@LINE' {
 				g.sb.write_string('__LINE__')
 			} else if node.name == '@VCURRENTHASH' || node.name == '@VHASH' {
-				hash_name := if node.name == '@VHASH' { 'VHASH' } else { 'VCURRENTHASH' }
-				g.sb.write_string(c_static_v_string_expr(hash_name))
+				g.sb.write_string(c_static_v_string_expr(g.get_v_hash()))
 			} else if node.name == '@VEXE' {
 				g.sb.write_string(c_empty_v_string_expr())
 			} else if node.name.starts_with('__type_id_') {
@@ -3194,7 +3193,7 @@ fn (mut g Gen) gen_comptime_expr(node ast.ComptimeExpr) {
 				g.sb.write_string('__LINE__')
 			}
 			'VCURRENTHASH' {
-				g.sb.write_string(c_static_v_string_expr('VCURRENTHASH'))
+				g.sb.write_string(c_static_v_string_expr(g.get_v_hash()))
 			}
 			'VEXE' {
 				g.sb.write_string('__vexe_path()')

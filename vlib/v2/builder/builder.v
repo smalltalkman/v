@@ -504,7 +504,11 @@ fn (mut b Builder) gen_cleanc() {
 		'out'
 	}
 
-	mut cc := configured_cc(b.pref.vroot)
+	mut cc := if b.pref.ccompiler.len > 0 {
+		b.pref.ccompiler
+	} else {
+		configured_cc(b.pref.vroot)
+	}
 	// -prod requires a real optimizing compiler — TCC cannot handle -O3/-flto.
 	// Switch to system cc (gcc/clang) when the default compiler is TCC.
 	if b.pref.is_prod && cc.contains('tcc') {
@@ -696,7 +700,7 @@ fn (mut b Builder) gen_ssa_c() {
 	// optimize.optimize(mut mod)
 	// print_time('SSA Optimize', time.Duration(sw.elapsed() - stage_start))
 
-	cc := configured_cc(b.pref.vroot)
+	cc := if b.pref.ccompiler.len > 0 { b.pref.ccompiler } else { configured_cc(b.pref.vroot) }
 	directive_flags := b.collect_cflags_from_sources()
 	mut cc_flag_parts := []string{}
 	env_flags := configured_cflags()

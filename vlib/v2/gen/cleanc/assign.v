@@ -826,6 +826,24 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 		if typ == '' || typ == 'void' {
 			typ = 'int'
 		}
+		// Check if declaring an interface pointer initialized with a concrete type
+		if typ.ends_with('*') && name != '' {
+			decl_base := typ.trim_right('*')
+			if g.is_interface_type(decl_base) {
+				decl_rhs_type := g.get_expr_type(rhs)
+				decl_rhs_base := decl_rhs_type.trim_right('*')
+				if decl_rhs_base != '' && decl_rhs_base != 'int' && decl_rhs_base != decl_base
+					&& !g.is_interface_type(decl_rhs_base) {
+					g.sb.write_string('${typ} ${name} = ')
+					if !g.gen_heap_interface_cast(decl_base, rhs) {
+						g.expr(rhs)
+					}
+					g.sb.writeln(';')
+					g.remember_runtime_local_type(name, typ)
+					return
+				}
+			}
+		}
 		g.sb.write_string('${typ} ${name} = ')
 		g.expr(rhs)
 		g.sb.writeln(';')
@@ -1023,6 +1041,17 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 		if lhs is ast.Ident {
 			if local_type := g.get_local_var_c_type(lhs.name) {
 				assign_lhs_type = local_type
+			} else {
+				// For globals, use the declared type from global_var_types.
+				// The env-based expr type may reflect the RHS type, not the LHS.
+				mut global_name := lhs.name
+				if global_name !in g.global_var_types && g.cur_module != ''
+					&& g.cur_module != 'main' && g.cur_module != 'builtin' {
+					global_name = '${g.cur_module}__${lhs.name}'
+				}
+				if global_name in g.global_var_types {
+					assign_lhs_type = g.global_var_types[global_name]
+				}
 			}
 		} else if lhs is ast.SelectorExpr {
 			if assign_lhs_type == '' || assign_lhs_type == 'int' {
@@ -1053,6 +1082,22 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 			g.sb.write_string('(*(${assign_lhs_type}*)')
 			g.expr(rhs)
 			g.sb.write_string(')')
+		} else if node.op == .assign && assign_lhs_type != '' && assign_lhs_type.ends_with('*') {
+			// Pointer assignment: check if LHS is a pointer to an interface type
+			// and RHS is a pointer to a concrete type (e.g., Logger* = new_thread_safe_log())
+			rhs_type := g.get_expr_type(rhs)
+			lhs_base := assign_lhs_type.trim_right('*')
+			rhs_base2 := rhs_type.trim_right('*')
+			if g.is_interface_type(lhs_base) && rhs_base2 != '' && rhs_base2 != 'int'
+				&& rhs_base2 != lhs_base && !g.is_interface_type(rhs_base2)
+				&& !lhs_base.starts_with('Array_') && lhs_base != 'array'
+				&& !lhs_base.starts_with('Map_') && lhs_base != 'map' {
+				if !g.gen_heap_interface_cast(lhs_base, rhs) {
+					g.expr(rhs)
+				}
+			} else {
+				g.expr(rhs)
+			}
 		} else if node.op == .assign && assign_lhs_type != '' && !assign_lhs_type.ends_with('*') {
 			rhs_type := g.get_expr_type(rhs)
 			lhs_base := assign_lhs_type.trim_right('*')

@@ -7,6 +7,7 @@ module cleanc
 import v2.ast
 import v2.pref
 import v2.types
+import os
 import strings
 import time
 
@@ -61,6 +62,7 @@ mut:
 	tmp_counter                 int
 	cur_fn_mut_params           map[string]bool   // names of mut params in current function
 	global_var_modules          map[string]string // global var name → module name
+	global_var_types            map[string]string // global var name → C type string
 	primitive_type_aliases      map[string]bool   // type names that are aliases for primitive types
 	emit_modules                map[string]bool   // when set, emit consts/globals/fns only for these modules
 	export_const_symbols        bool
@@ -99,6 +101,7 @@ mut:
 	c_file_fn_keys   map[string]bool // fn_key -> emitted from a .c.v file, so plain .v fallback should be skipped
 	typedef_c_types  map[string]bool // C struct names with @[typedef] attribute (emit without 'struct' prefix)
 	blocked_fn_keys  map[string]bool // worker-only fn keys reserved to other pass5 chunks
+	cached_vhash     string          // cached git short hash for @VHASH/@VCURRENTHASH
 }
 
 struct LiveFnInfo {
@@ -146,6 +149,26 @@ const primitive_types = ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', '
 
 fn is_empty_stmt(s ast.Stmt) bool {
 	return s is ast.EmptyStmt
+}
+
+fn (mut g Gen) get_v_hash() string {
+	if g.cached_vhash.len > 0 {
+		return g.cached_vhash
+	}
+	vroot := if g.pref != unsafe { nil } && g.pref.vroot.len > 0 {
+		g.pref.vroot
+	} else {
+		''
+	}
+	if vroot.len > 0 {
+		result := os.execute('git -C "${vroot}" rev-parse --short=7 HEAD')
+		if result.exit_code == 0 {
+			g.cached_vhash = result.output.trim_space()
+			return g.cached_vhash
+		}
+	}
+	g.cached_vhash = 'unknown'
+	return g.cached_vhash
 }
 
 fn stmt_has_valid_data(stmt ast.Stmt) bool {
