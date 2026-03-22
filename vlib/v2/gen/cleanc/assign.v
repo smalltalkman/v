@@ -10,16 +10,6 @@ import v2.types
 fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 	lhs := node.lhs[0]
 	rhs := node.rhs[0]
-	if rhs is ast.OrExpr && rhs.pos.id == 235054 {
-		panic('debug gen_assign or lhs=${lhs.name()} stmt_pos=${node.pos} rhs_pos=${rhs.pos} file=${g.cur_file_name} fn=${g.cur_fn_name}')
-	}
-	if g.cur_fn_name.contains('get_or_panic') && lhs is ast.Ident && lhs.name.starts_with('_or_t') {
-		rhs_is_call := rhs is ast.CallExpr
-		rhs_is_coc := rhs is ast.CallOrCastExpr
-		rhs_is_ident := rhs is ast.Ident
-		eprintln('DEBUG cleanc assign _or_t: fn=${g.cur_fn_name} lhs=${lhs.name} rhs_is_call=${rhs_is_call} rhs_is_coc=${rhs_is_coc} rhs_is_ident=${rhs_is_ident} rhs_name=${rhs.name()}')
-	}
-
 	// Multi-assignment with parallel RHS values (non-declaration):
 	// `p, q = q, p` needs temp variables for correct swap semantics.
 	if node.op != .decl_assign && node.lhs.len > 1 && node.rhs.len == node.lhs.len {
@@ -284,6 +274,14 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 					g.sb.writeln('${elem_type} ${name} = ${tmp_name}.arg${i};')
 					g.remember_runtime_local_type(name, elem_type)
 				} else {
+					mut assign_name := ''
+					if lhs_expr is ast.Ident {
+						assign_name = lhs_expr.name
+					}
+					if assign_name == '_' {
+						g.sb.writeln('(void)${tmp_name}.arg${i};')
+						continue
+					}
 					g.expr(lhs_expr)
 					g.sb.writeln(' = ${tmp_name}.arg${i};')
 				}
@@ -430,6 +428,16 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 								}
 							}
 						}
+					}
+				}
+			}
+			// For _or_t vars where RHS is a call through a function pointer variable,
+			// infer the return type from the function pointer's type.
+			if typ == 'int' || typ == '' {
+				if rhs is ast.CallExpr {
+					fn_ptr_ret := g.fn_pointer_return_type(rhs.lhs)
+					if fn_ptr_ret != '' && fn_ptr_ret != 'int' && fn_ptr_ret != 'void' {
+						typ = fn_ptr_ret
 					}
 				}
 			}
@@ -764,9 +772,26 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 			&& rhs !is ast.CallExpr {
 			g.sb.writeln('${typ} ${name};')
 			g.write_indent()
-			g.sb.write_string('memcpy(${name}, ')
-			g.expr(rhs)
-			g.sb.writeln(', sizeof(${typ}));')
+			// For fixed arrays, check if RHS is a zero-init or type-incompatible pattern.
+			// UnsafeExpr wrapping an array init, plain InitExpr, or dynamic array type
+			// should all use memset for zero-init instead of memcpy.
+			mut is_fixed_arr_zero := rhs is ast.InitExpr && rhs.fields.len == 0
+			if !is_fixed_arr_zero && rhs is ast.UnsafeExpr {
+				is_fixed_arr_zero = true // unsafe { [N]T{init: expr} } → memset for now
+			}
+			if !is_fixed_arr_zero {
+				fa_rhs_type := g.get_expr_type(rhs)
+				if fa_rhs_type == '' || fa_rhs_type == 'array' || fa_rhs_type == 'int' {
+					is_fixed_arr_zero = true
+				}
+			}
+			if is_fixed_arr_zero {
+				g.sb.writeln('memset(${name}, 0, sizeof(${typ}));')
+			} else {
+				g.sb.write_string('memcpy(${name}, ')
+				g.expr(rhs)
+				g.sb.writeln(', sizeof(${typ}));')
+			}
 			g.remember_runtime_local_type(name, typ)
 			return
 		}

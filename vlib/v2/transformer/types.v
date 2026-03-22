@@ -1848,6 +1848,11 @@ fn (t &Transformer) get_expr_type(expr ast.Expr) ?types.Type {
 		if typ := t.env.get_expr_type(pos.id) {
 			return typ
 		}
+		// Check synth_types for types registered during the current transform pass
+		// (they haven't been applied to env yet).
+		if typ := t.synth_types[pos.id] {
+			return typ
+		}
 	}
 	return none
 }
@@ -2212,6 +2217,29 @@ fn (t &Transformer) array_value_elem_type(expr ast.Expr) ?string {
 	if elem_type := t.get_array_elem_type_str(expr) {
 		return elem_type
 	}
+	// PostfixExpr `!` or `?` (error/option propagation) unwraps the inner expression.
+	// e.g., `parse_ipv4(address)!` → inner `parse_ipv4(address)` returns `![]u8`,
+	// so the unwrapped result is `[]u8`.
+	if expr is ast.PostfixExpr && expr.op in [.not, .question] {
+		// Try direct recursion (checker may annotate the inner expr with the array type)
+		if elem := t.array_value_elem_type(expr.expr) {
+			return elem
+		}
+		// For calls returning Result/Option, the call return type is _result_Array_T.
+		// Strip the wrapper prefix to get the underlying array type.
+		if expr.expr is ast.CallExpr || expr.expr is ast.CallOrCastExpr {
+			ret_type := t.get_call_return_type(expr.expr)
+			mut base := ret_type
+			if base.starts_with('_result_') {
+				base = base['_result_'.len..]
+			} else if base.starts_with('_option_') {
+				base = base['_option_'.len..]
+			}
+			if base.starts_with('Array_') {
+				return base['Array_'.len..]
+			}
+		}
+	}
 	if expr is ast.CallExpr || expr is ast.CallOrCastExpr {
 		ret_type := t.get_call_return_type(expr)
 		if ret_type.starts_with('Array_fixed_') {
@@ -2522,6 +2550,9 @@ fn (t &Transformer) type_to_c_name(typ types.Type) string {
 			// (This is used in map type names like Map_int_Intervalptr)
 			return '${base_name}ptr'
 		}
+		types.Channel {
+			return 'chan'
+		}
 		types.FnType {
 			return 'voidptr'
 		}
@@ -2564,7 +2595,7 @@ fn (t &Transformer) get_enum_type_name(expr ast.Expr) string {
 	// Check scope for variable type
 	if expr is ast.Ident {
 		type_name := t.get_var_type_name(expr.name)
-		if type_name != '' && type_name != 'int' && type_name != 'string' && type_name != 'bool' {
+		if type_name != '' && type_name !in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'f32', 'f64', 'string', 'bool', 'rune', 'voidptr', 'byteptr', 'charptr', 'nil'] {
 			return type_name
 		}
 	}

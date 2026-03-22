@@ -694,6 +694,25 @@ fn (mut t Transformer) transform_selector_expr(expr ast.SelectorExpr) ast.Expr {
 			}
 		}
 	}
+	// Handle same-module enum access: Op.identify -> discord__Op__identify
+	if expr.lhs is ast.Ident {
+		lhs_name := expr.lhs.name
+		// Check if LHS is an enum type in the current module
+		qualified := if t.cur_module != '' && t.cur_module != 'main'
+			&& t.cur_module != 'builtin' && !lhs_name.contains('__') {
+			'${t.cur_module}__${lhs_name}'
+		} else {
+			lhs_name
+		}
+		if typ := t.lookup_type(qualified) {
+			if typ is types.Enum {
+				return ast.Ident{
+					name: enum_member_ident(qualified, expr.rhs.name)
+					pos:  expr.pos
+				}
+			}
+		}
+	}
 	// Default transformation
 	return ast.SelectorExpr{
 		lhs: t.transform_expr(expr.lhs)
@@ -1847,6 +1866,31 @@ fn (mut t Transformer) transform_infix_expr(expr ast.InfixExpr) ast.Expr {
 					}), expr.pos)
 				}
 			}
+			// Interface self-type check: `iface_var is InterfaceType` where the variable
+			// is already of that interface type. This checks non-nil (type_id != 0).
+			if sumtype_name == '' {
+				if lhs_type := t.get_expr_type(expr.lhs) {
+					lhs_base := t.unwrap_alias_and_pointer_type(lhs_type)
+					if lhs_base is types.Interface {
+						is_self_check := lhs_base.name.ends_with(variant_name)
+							|| lhs_base.name == variant_name
+						if is_self_check {
+							transformed_lhs := t.transform_expr(expr.lhs)
+							cmp_op := if expr.op in [.key_is, .eq] {
+								token.Token.ne
+							} else {
+								token.Token.eq
+							}
+							return t.make_infix_expr_at(cmp_op, t.synth_selector(transformed_lhs,
+								'_type_id', types.Type(types.int_)), ast.Expr(ast.BasicLiteral{
+								kind:  token.Token.number
+								value: '0'
+								pos:   expr.pos
+							}), expr.pos)
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -2152,7 +2196,7 @@ fn (mut t Transformer) transform_infix_expr(expr ast.InfixExpr) ast.Expr {
 			}
 			if !has_unresolved_shorthand {
 				mut method_info := arr_info
-				if enum_type != '' {
+				if enum_type != '' && !arr_info.is_fixed {
 					enum_c_name := t.v_type_name_to_c_name(enum_type)
 					if enum_c_name != '' {
 						method_info = ArrayMethodInfo{
@@ -2210,12 +2254,41 @@ fn (mut t Transformer) transform_infix_expr(expr ast.InfixExpr) ast.Expr {
 			// Use push_many only when RHS element type matches the LHS element type.
 			// This avoids mis-lowering [][]T << []T, which must stay a single push.
 			mut rhs_is_array := false
-			if rhs_elem_type := t.array_value_elem_type(expr.rhs) {
-				rhs_is_array = t.array_elem_types_compatible(elem_type_name, rhs_elem_type)
-			} else {
-				lhs_is_nested_array := elem_type_name.starts_with('Array_')
-					|| elem_type_name.starts_with('Array_fixed_')
-				rhs_is_array = t.is_array_value_expr(expr.rhs) && !lhs_is_nested_array
+			// Enum shorthand (.member) is never an array value, even if the checker
+			// annotated it with the LHS array type instead of the element enum type.
+			rhs_is_enum_shorthand := expr.rhs is ast.SelectorExpr
+				&& (expr.rhs as ast.SelectorExpr).lhs is ast.EmptyExpr
+			if !rhs_is_enum_shorthand {
+				if rhs_elem_type := t.array_value_elem_type(expr.rhs) {
+					rhs_is_array = t.array_elem_types_compatible(elem_type_name, rhs_elem_type)
+				} else {
+					lhs_is_nested_array := elem_type_name.starts_with('Array_')
+						|| elem_type_name.starts_with('Array_fixed_')
+					rhs_is_array = t.is_array_value_expr(expr.rhs) && !lhs_is_nested_array
+				}
+			}
+			// Or-data-extract: _or_tN.data where the temp var holds a Result/Option of array.
+			// extract_or_expr replaces `call()!` with `_or_tN.data`, losing the PostfixExpr
+			// that array_value_elem_type would have recognized. Check the temp var's type.
+			if !rhs_is_array && expr.rhs is ast.SelectorExpr {
+				rhs_sel := expr.rhs as ast.SelectorExpr
+				if rhs_sel.rhs.name == 'data' && rhs_sel.lhs is ast.Ident {
+					or_ident := rhs_sel.lhs as ast.Ident
+					if or_ident.name.starts_with('_or_t') {
+						if or_type := t.lookup_var_type(or_ident.name) {
+							unwrapped := if or_type is types.ResultType {
+								or_type.base_type
+							} else if or_type is types.OptionType {
+								or_type.base_type
+							} else {
+								or_type
+							}
+							if unwrapped is types.Array {
+								rhs_is_array = true
+							}
+						}
+					}
+				}
 			}
 
 			// Check if LHS is already a pointer (e.g., mut receiver of type strings.Builder*)

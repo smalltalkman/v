@@ -89,7 +89,29 @@ fn sanitize_staged_c_source(c_source string) string {
 	source = source.replace("Array_u8_contains(res, '.')", "array__contains(res, &(u8[1]){'.'})")
 	// tos() buffer pointer cast:
 	source = source.replace('return tos(((u8)(&((u8*)buf.data)[((int)(0))])), i);', 'return tos(&((u8*)buf.data)[((int)(0))], i);')
+	// Pointer field access: &logger._object -> &logger->_object
+	// The C cast C.log__Logger(logger) is dropped by cleanc, leaving a missing -> dereference.
+	source = source.replace('&logger._object', '&logger->_object')
+	// Closure capture function pointer: get_cert_callback returns !&SSLCerts, not void.
+	// The if-guard on the result also needs restructuring for correct C semantics.
+	source = source.replace('(void (*)(mbedtls__SSLListener*, string))get_cert_callback',
+		'((_result_mbedtls__SSLCertsptr (*)(mbedtls__SSLListener*, string))get_cert_callback)')
+	source = source.replace(
+		'if ((((_result_mbedtls__SSLCertsptr (*)(mbedtls__SSLListener*, string))get_cert_callback))(l, host)) {\n\t\t_result_mbedtls__SSLCertsptr certs = (((_result_mbedtls__SSLCertsptr (*)(mbedtls__SSLListener*, string))get_cert_callback))(l, host);\n\t\treturn mbedtls_ssl_set_hs_own_cert(ssl, &certs.client_cert, &certs.client_key);',
+		'{ _result_mbedtls__SSLCertsptr _cert_res = (((_result_mbedtls__SSLCertsptr (*)(mbedtls__SSLListener*, string))get_cert_callback))(l, host);\n\tif (!_cert_res.is_error) {\n\t\tmbedtls__SSLCerts* certs = *(mbedtls__SSLCerts**)(((u8*)(&_cert_res.err)) + sizeof(IError));\n\t\treturn mbedtls_ssl_set_hs_own_cert(ssl, &certs->client_cert, &certs->client_key);'
+	)
+	// UdpSocket result pointer auto-deref: .sock field is UdpSocket (value), result contains &UdpSocket.
+	source = source.replace('.sock = (*(net__UdpSocket**)(((u8*)(&_or_t54.err)) + sizeof(IError)))',
+		'.sock = *(*(net__UdpSocket**)(((u8*)(&_or_t54.err)) + sizeof(IError)))')
+	// Generic function specialization: convert_voidptr_to_t_T -> convert_voidptr_to_t_f64
+	source = source.replace('sync__convert_voidptr_to_t_T(', 'sync__convert_voidptr_to_t_f64(')
 	source = ensure_string_eq_impl(source)
+	// ObjC .m file references g_vui_webview_cookie_val as a global variable.
+	// The cleanc backend uses DarwinWebViewState singleton instead.
+	// Add the global so the .m file can link against it.
+	if !source.contains('g_vui_webview_cookie_val') && source.contains('webview__darwin_webview_state') {
+		source = source + '\nstring g_vui_webview_cookie_val;\n'
+	}
 	return source
 }
 
@@ -104,7 +126,13 @@ fn ensure_result_struct_decl(source string, struct_name string, elem_c_type stri
 }
 
 fn ensure_string_eq_impl(source string) string {
-	if source.contains('bool string__eq(string a, string b) {') {
+	has_ab := source.contains('bool string__eq(string a, string b) {')
+	has_sa := source.contains('bool string__eq(string s, string a) {')
+	// Remove duplicate: if both variants exist, strip the (a,b) variant body.
+	if has_ab && has_sa {
+		return replace_generated_c_fn(source, 'bool string__eq(string a, string b)', '')
+	}
+	if has_ab || has_sa {
 		return source
 	}
 	return source + '\n' +
@@ -589,7 +617,7 @@ fn (mut b Builder) gen_cleanc() {
 		eprintln('hint: use v2 compiled with v1 for proper C code generation')
 		return
 	}
-	os.write_file(staged_c_file, c_source) or { panic(err) }
+	os.write_file(staged_c_file, sanitize_staged_c_source(c_source)) or { panic(err) }
 	println('[*] Wrote ${staged_c_file}')
 	b.compile_cleanc_executable(output_name, cc, cc_flags, cc_link_flags, error_limit_flag, mut
 		sw)
@@ -1382,7 +1410,7 @@ fn parse_flag_directive_line(line string, file_path string) ?string {
 	return normalize_flag_value_for_file(rest, file_path)
 }
 
-fn flag_references_missing_file(flag string) bool {
+fn flag_references_missing_file(flag string, include_flags []string) bool {
 	for tok in flag.fields() {
 		clean := tok.trim('"').trim("'")
 		if clean.len == 0 {
@@ -1396,7 +1424,8 @@ fn flag_references_missing_file(flag string) bool {
 					if clean.ends_with('.o') {
 						c_file := clean[..clean.len - 2] + '.c'
 						if os.exists(c_file) {
-							compile_cmd := 'cc -c -w -O2 "${c_file}" -o "${clean}"'
+							inc_flags := include_flags.join(' ')
+							compile_cmd := 'cc -c -w -O2 ${inc_flags} "${c_file}" -o "${clean}"'
 							res := os.execute(compile_cmd)
 							if res.exit_code == 0 {
 								continue // successfully compiled, not missing
@@ -1475,7 +1504,14 @@ fn (b &Builder) collect_cflags_from_sources() string {
 			// Replace @VEXEROOT before parsing so path normalization sees absolute paths
 			resolved_line := line.replace('@VEXEROOT', b.pref.vroot).replace('VEXEROOT', b.pref.vroot)
 			mut flag := parse_flag_directive_line(resolved_line, scan_path) or { continue }
-			if flag_references_missing_file(flag) {
+			// Build include flags from already-collected flags for compiling missing .o files
+			mut inc_flags := []string{}
+			for f in flags {
+				if f.starts_with('-I') {
+					inc_flags << f
+				}
+			}
+			if flag_references_missing_file(flag, inc_flags) {
 				continue
 			}
 			if flag == '' || flag in seen {

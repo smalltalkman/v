@@ -506,7 +506,15 @@ fn (mut g Gen) gen_struct_decl(node ast.StructDecl) {
 					}
 				}
 			}
+			// Collect direct field names to avoid overriding with embedded fields
+			mut direct_field_names := map[string]bool{}
+			for field in node.fields {
+				direct_field_names[field.name] = true
+			}
 			for ef in embedded.fields {
+				if ef.name in direct_field_names {
+					continue
+				}
 				key := name + '.' + ef.name
 				g.embedded_field_owner[key] = emb_field_name
 				embedded_field_type := g.types_type_to_c(ef.typ)
@@ -515,6 +523,42 @@ fn (mut g Gen) gen_struct_decl(node ast.StructDecl) {
 					short_key := name.all_after_last('__') + '.' + ef.name
 					g.embedded_field_owner[short_key] = emb_field_name
 					g.struct_field_types[short_key] = embedded_field_type
+				}
+			}
+			// Recursively register fields from nested embedded structs.
+			// E.g., if A embeds B and B embeds C with field f, register
+			// A.f → B_owner.C_owner.f so that a.f generates a.B.C.f in C.
+			emb_struct_info := g.lookup_struct_type_by_c_name(emb_type)
+			for sub_emb in emb_struct_info.embedded {
+				sub_emb_c_name := g.types_type_to_c(types.Type(sub_emb))
+				sub_emb_field := if sub_emb_c_name.contains('__') {
+					sub_emb_c_name.all_after_last('__')
+				} else {
+					sub_emb_c_name
+				}
+				// The embedded copy may have stale (empty) fields if the sub-struct
+				// was processed after the parent by the checker. Re-lookup live type.
+				mut live_sub := sub_emb
+				if sub_emb.fields.len == 0 && sub_emb_c_name != '' {
+					live_sub = g.lookup_struct_type_by_c_name(sub_emb_c_name)
+				}
+				for sf in live_sub.fields {
+					if sf.name in direct_field_names {
+						continue
+					}
+					sub_key := name + '.' + sf.name
+					if sub_key !in g.embedded_field_owner {
+						g.embedded_field_owner[sub_key] = '${emb_field_name}.${sub_emb_field}'
+						sub_field_type := g.types_type_to_c(sf.typ)
+						g.struct_field_types[sub_key] = sub_field_type
+						if name.contains('__') {
+							short_sub_key := name.all_after_last('__') + '.' + sf.name
+							if short_sub_key !in g.embedded_field_owner {
+								g.embedded_field_owner[short_sub_key] = '${emb_field_name}.${sub_emb_field}'
+								g.struct_field_types[short_sub_key] = sub_field_type
+							}
+						}
+					}
 				}
 			}
 		}
@@ -1382,6 +1426,12 @@ fn (mut g Gen) gen_init_expr(node ast.InitExpr) {
 			g.sb.write_string('(*(')
 			g.expr(field.value)
 			g.sb.write_string('))')
+			continue
+		}
+		// Auto-wrap concrete types into interface structs for interface-typed fields
+		// (e.g. output_stream: log__stderr where output_stream is io__Writer and stderr is os__File)
+		if expected_field_type != '' && g.is_interface_type(expected_field_type)
+			&& g.gen_interface_cast(expected_field_type, field.value) {
 			continue
 		}
 		g.expr(field.value)

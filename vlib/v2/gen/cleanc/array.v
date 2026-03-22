@@ -116,15 +116,28 @@ fn (mut g Gen) emit_missing_array_contains_fallbacks() {
 		}
 		g.emitted_types[fn_key] = true
 		g.sb.writeln('')
-		g.sb.writeln('__attribute__((weak)) bool ${fn_name}(${arr_type} a, ${elem_type} v) {')
-		g.sb.writeln('\tfor (int i = 0; (i < a.len); i += 1) {')
-		if elem_type == 'string' {
-			g.sb.writeln('\t\tif (string__eq(*((string*)(array__get(a, i))), v)) {')
+		// Fixed arrays are C arrays (e.g., voidptr[20]), not structs — use direct indexing.
+		is_fixed := arr_type.starts_with('Array_fixed_')
+		if is_fixed {
+			_, fixed_len := g.parse_fixed_array_type(arr_type)
+			g.sb.writeln('__attribute__((weak)) bool ${fn_name}(${arr_type} a, ${elem_type} v) {')
+			g.sb.writeln('\tfor (int i = 0; i < ${fixed_len}; i++) {')
+			if elem_type == 'string' {
+				g.sb.writeln('\t\tif (string__eq(a[i], v)) {')
+			} else {
+				g.sb.writeln('\t\tif (memcmp(&a[i], &v, sizeof(${elem_type})) == 0) {')
+			}
 		} else {
-			left_cmp := '_cmp_l_${g.tmp_counter}'
-			right_cmp := '_cmp_r_${g.tmp_counter + 1}'
-			g.tmp_counter += 2
-			g.sb.writeln('\t\tif (({ ${elem_type} ${left_cmp} = *((${elem_type}*)(array__get(a, i))); ${elem_type} ${right_cmp} = v; memcmp(&${left_cmp}, &${right_cmp}, sizeof(${elem_type})) == 0; })) {')
+			g.sb.writeln('__attribute__((weak)) bool ${fn_name}(${arr_type} a, ${elem_type} v) {')
+			g.sb.writeln('\tfor (int i = 0; (i < a.len); i += 1) {')
+			if elem_type == 'string' {
+				g.sb.writeln('\t\tif (string__eq(*((string*)(array__get(a, i))), v)) {')
+			} else {
+				left_cmp := '_cmp_l_${g.tmp_counter}'
+				right_cmp := '_cmp_r_${g.tmp_counter + 1}'
+				g.tmp_counter += 2
+				g.sb.writeln('\t\tif (({ ${elem_type} ${left_cmp} = *((${elem_type}*)(array__get(a, i))); ${elem_type} ${right_cmp} = v; memcmp(&${left_cmp}, &${right_cmp}, sizeof(${elem_type})) == 0; })) {')
+			}
 		}
 		g.sb.writeln('\t\t\treturn true;')
 		g.sb.writeln('\t\t}')
@@ -274,6 +287,16 @@ fn (mut g Gen) expr_is_array_value(expr ast.Expr) bool {
 	if expr_type == 'array' || expr_type.starts_with('Array_') {
 		return true
 	}
+	// Or-data-access: _or_tN.data where _or_tN has type _result_Array_X or _option_Array_X
+	if expr is ast.SelectorExpr && expr.rhs.name == 'data' {
+		if expr.lhs is ast.Ident {
+			lhs_type := g.get_expr_type(expr.lhs)
+			if (lhs_type.starts_with('_result_Array_') || lhs_type.starts_with('_result_array'))
+				|| (lhs_type.starts_with('_option_Array_') || lhs_type.starts_with('_option_array')) {
+				return true
+			}
+		}
+	}
 	if raw_type := g.get_raw_type(expr) {
 		match raw_type {
 			types.Array {
@@ -316,6 +339,16 @@ fn (mut g Gen) expr_array_runtime_type(expr ast.Expr) string {
 		inner_type := g.expr_array_runtime_type(expr.expr)
 		if inner_type.ends_with('*') {
 			return inner_type[..inner_type.len - 1]
+		}
+	}
+	// Or-data-access: _or_tN.data — extract array type from result/option wrapper
+	if expr is ast.SelectorExpr && expr.rhs.name == 'data' && expr.lhs is ast.Ident {
+		lhs_type := g.get_expr_type(expr.lhs)
+		if lhs_type.starts_with('_result_') {
+			return lhs_type['_result_'.len..]
+		}
+		if lhs_type.starts_with('_option_') {
+			return lhs_type['_option_'.len..]
 		}
 	}
 	mut typ := g.get_expr_type(expr)

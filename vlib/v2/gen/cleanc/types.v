@@ -763,6 +763,15 @@ fn (g &Gen) normalize_enum_name(name string) string {
 			return name[g.cur_module.len + 2..]
 		}
 	}
+	// When the name has a module prefix (e.g., sync__ChanState) but the emitted
+	// enum uses the short name (e.g., ChanState — a builtin type referenced from
+	// the sync module), strip the prefix so references match the typedef.
+	if name.contains('__') {
+		short := name.all_after_last('__')
+		if 'enum_${short}' in g.emitted_types && 'enum_${name}' !in g.emitted_types {
+			return short
+		}
+	}
 	return name
 }
 
@@ -1093,7 +1102,13 @@ fn (mut g Gen) lookup_embedded_field_info_in_struct(st types.Struct, field_name 
 	for embedded in st.embedded {
 		embedded_c_type := g.types_type_to_c(embedded)
 		owner := embedded_owner_field_name(embedded_c_type)
-		for field in embedded.fields {
+		// Use live lookup if the embedded copy has stale (empty) fields
+		live_emb := if embedded.fields.len == 0 && embedded_c_type != '' {
+			g.lookup_struct_type_by_c_name(embedded_c_type)
+		} else {
+			embedded
+		}
+		for field in live_emb.fields {
 			if field.name == field_name {
 				return EmbeddedFieldLookupInfo{
 					owner:      owner
@@ -1101,7 +1116,7 @@ fn (mut g Gen) lookup_embedded_field_info_in_struct(st types.Struct, field_name 
 				}
 			}
 		}
-		if nested := g.lookup_embedded_field_info_in_struct(embedded, field_name) {
+		if nested := g.lookup_embedded_field_info_in_struct(live_emb, field_name) {
 			return EmbeddedFieldLookupInfo{
 				owner:      owner
 				field_type: nested.field_type
@@ -1170,6 +1185,21 @@ fn (mut g Gen) lookup_embedded_field_info_in_decl(info StructDeclInfo, field_nam
 	return none
 }
 
+fn (mut g Gen) has_struct_field(c_type_name string, field_name string) bool {
+	// Special-case `string` which is types.String, not types.Struct.
+	// Its fields (str, len, is_lit) are defined in the builtin struct.
+	if c_type_name == 'string' {
+		return field_name in ['str', 'len', 'is_lit']
+	}
+	s := g.lookup_struct_type_by_c_name(c_type_name)
+	for f in s.fields {
+		if f.name == field_name {
+			return true
+		}
+	}
+	return false
+}
+
 fn (mut g Gen) lookup_embedded_field_info(struct_name string, field_name string) ?EmbeddedFieldLookupInfo {
 	if struct_name == '' || field_name == '' {
 		return none
@@ -1182,8 +1212,20 @@ fn (mut g Gen) lookup_embedded_field_info(struct_name string, field_name string)
 			struct_type = g.lookup_struct_type_by_c_name(base_name)
 		}
 	}
+	// If the struct has a direct field with this name, don't route through embedded
+	for f in struct_type.fields {
+		if f.name == field_name {
+			return none
+		}
+	}
 	if struct_type.fields.len == 0 && struct_type.embedded.len == 0 {
 		if decl_info := g.find_struct_decl_info_by_c_name(base_name) {
+			// Also check AST direct fields
+			for f in decl_info.decl.fields {
+				if f.name == field_name {
+					return none
+				}
+			}
 			return g.lookup_embedded_field_info_in_decl(decl_info, field_name)
 		}
 		return none
@@ -1702,11 +1744,11 @@ fn (mut g Gen) get_expr_type(node ast.Expr) string {
 	// For identifiers, check local/parameter types first (authoritative),
 	// then fall back to env position lookup.
 	if node is ast.Ident {
-		if node.name == 'err' {
-			return 'IError'
-		}
 		if local_type := g.get_local_var_c_type(node.name) {
 			return local_type
+		}
+		if node.name == 'err' {
+			return 'IError'
 		}
 		// Env pos.id O(1) lookup.
 		if t := g.get_expr_type_from_env(node) {
@@ -2510,7 +2552,28 @@ fn (g &Gen) is_c_type_name(name string) bool {
 // These bindings are used when emitting methods on the generic struct.
 fn (mut g Gen) record_generic_struct_bindings(struct_base_name string, struct_c_name string, concrete_params []ast.Expr) {
 	if struct_c_name in g.generic_struct_bindings {
-		return
+		// Allow override: prefer string/int/bool bindings over custom types.
+		// Without full monomorphization, we need the most common binding to avoid
+		// type mismatches. String is the most common eventbus/generic type param.
+		mut should_override := false
+		for p in concrete_params {
+			pname := p.name()
+			if pname in ['string', 'int', 'bool', 'u8', 'i64', 'f64'] {
+				// Check if current binding differs
+				if existing := g.generic_struct_bindings[struct_c_name] {
+					for _, v in existing {
+						if v.name() != pname {
+							should_override = true
+							break
+						}
+					}
+				}
+				break
+			}
+		}
+		if !should_override {
+			return
+		}
 	}
 	// Find the struct decl to get generic param names.
 	env_struct := g.lookup_struct_type(struct_base_name)

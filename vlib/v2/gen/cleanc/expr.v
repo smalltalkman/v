@@ -389,7 +389,13 @@ fn (mut g Gen) gen_heap_interface_cast(type_name string, value_expr ast.Expr) bo
 	g.sb.write_string(', ._type_id = ${type_id}')
 	if methods := g.interface_methods[type_name] {
 		for method in methods {
-			fn_name := '${base_concrete}__${method.name}'
+			mut fn_name := '${base_concrete}__${method.name}'
+			if fn_name !in g.fn_param_is_ptr && fn_name !in g.fn_return_types {
+				resolved := g.resolve_embedded_method(base_concrete, method.name)
+				if resolved != '' {
+					fn_name = resolved
+				}
+			}
 			mut target_name := fn_name
 			if ptr_params := g.fn_param_is_ptr[fn_name] {
 				if ptr_params.len > 0 && !ptr_params[0] {
@@ -450,6 +456,12 @@ fn (mut g Gen) gen_interface_cast(type_name string, value_expr ast.Expr) bool {
 		effective_value = value_expr.expr
 	}
 	is_rvalue := !concrete_type.ends_with('*') && !g.can_take_address(effective_value)
+	// Use a temp variable when there are data fields and the expression is complex
+	// (e.g., a function call returning a pointer). This avoids re-evaluating the
+	// expression for each data field reference, preventing exponential code blowup.
+	data_fields := g.interface_data_fields[type_name]
+	needs_ptr_tmp := concrete_type.ends_with('*') && data_fields.len > 0
+		&& !g.is_simple_addressable(effective_value)
 	mut rvalue_tmp := ''
 	if is_rvalue {
 		rvalue_tmp = '_iface_obj${g.tmp_counter}'
@@ -457,6 +469,12 @@ fn (mut g Gen) gen_interface_cast(type_name string, value_expr ast.Expr) bool {
 		g.sb.write_string('({ ${base_concrete} ${rvalue_tmp} = ')
 		g.expr(effective_value)
 		g.sb.write_string('; (${type_name}){._object = (void*)&${rvalue_tmp}')
+	} else if needs_ptr_tmp {
+		rvalue_tmp = '_iface_ptr${g.tmp_counter}'
+		g.tmp_counter++
+		g.sb.write_string('({ ${base_concrete}* ${rvalue_tmp} = ')
+		g.expr(effective_value)
+		g.sb.write_string('; (${type_name}){._object = (void*)(${rvalue_tmp})')
 	} else {
 		g.sb.write_string('((${type_name}){._object = ')
 		if concrete_type.ends_with('*') {
@@ -479,7 +497,16 @@ fn (mut g Gen) gen_interface_cast(type_name string, value_expr ast.Expr) bool {
 	// Generate method function pointers from stored interface info
 	if methods := g.interface_methods[type_name] {
 		for method in methods {
-			fn_name := '${base_concrete}__${method.name}'
+			mut fn_name := '${base_concrete}__${method.name}'
+			// If the method doesn't exist on the concrete type directly,
+			// try resolving through embedded structs (e.g. ssl__SSLConn embeds
+			// openssl__SSLConn, so ssl__SSLConn__addr → openssl__SSLConn__addr).
+			if fn_name !in g.fn_param_is_ptr && fn_name !in g.fn_return_types {
+				resolved := g.resolve_embedded_method(base_concrete, method.name)
+				if resolved != '' {
+					fn_name = resolved
+				}
+			}
 			mut target_name := fn_name
 			if ptr_params := g.fn_param_is_ptr[fn_name] {
 				if ptr_params.len > 0 && !ptr_params[0] {
@@ -498,7 +525,7 @@ fn (mut g Gen) gen_interface_cast(type_name string, value_expr ast.Expr) bool {
 		}
 	}
 	// Generate data field pointers: .field = &(concrete->field)
-	if data_fields := g.interface_data_fields[type_name] {
+	if data_fields.len > 0 {
 		sep := if concrete_type.ends_with('*') { '->' } else { '.' }
 		for df in data_fields {
 			embedded_owner := g.embedded_owner_for(base_concrete, df.name)
@@ -778,6 +805,21 @@ fn (mut g Gen) gen_unwrapped_value_expr(expr ast.Expr) bool {
 fn (mut g Gen) gen_infix_expr(node &ast.InfixExpr) {
 	lhs_type := g.get_expr_type(node.lhs)
 	rhs_type := g.get_expr_type(node.rhs)
+	// Channel push: ch <- value → sync__Channel__try_push_priv(ch, &(elem_type){value}, false)
+	if node.op == .arrow {
+		mut elem_type := g.channel_elem_type_from_expr(node.lhs) or { 'bool' }
+		if elem_type == '' || elem_type == 'int' {
+			elem_type = 'bool'
+		}
+		g.force_emit_fn_names['sync__Channel__try_push_priv'] = true
+		g.called_fn_names['sync__Channel__try_push_priv'] = true
+		g.sb.write_string('sync__Channel__try_push_priv((sync__Channel*)')
+		g.expr(node.lhs)
+		g.sb.write_string(', &(${elem_type}[]){')
+		g.expr(node.rhs)
+		g.sb.write_string('}, false)')
+		return
+	}
 	if node.op in [.logical_or, .and] {
 		g.sb.write_string('(')
 		if !g.gen_unwrapped_value_expr(node.lhs) {
@@ -963,6 +1005,28 @@ fn (mut g Gen) gen_infix_expr(node &ast.InfixExpr) {
 					return
 				}
 			}
+			// Fallback: interface is-check when get_raw_type didn't resolve
+			// (e.g. through smartcast chains like child.layout is Widget)
+			if node.op in [.key_is, .not_is] && variants.len == 0 {
+				mut field_type := lhs_sum_type
+				if field_type == '' && node.lhs is ast.SelectorExpr {
+					field_type = g.selector_field_type(node.lhs)
+				}
+				if field_type != '' {
+					base_ft := field_type.trim_right('*')
+					if g.is_interface_type(base_ft) {
+						type_id := interface_type_id_for_name(rhs_name)
+						if type_id > 0 {
+							sep := if g.expr_is_pointer(node.lhs) { '->' } else { '.' }
+							op := if node.op == .key_is { '==' } else { '!=' }
+							g.sb.write_string('(')
+							g.expr(node.lhs)
+							g.sb.write_string('${sep}_type_id ${op} ${type_id})')
+							return
+						}
+					}
+				}
+			}
 		}
 	}
 	if node.op == .left_shift {
@@ -1082,6 +1146,27 @@ fn (mut g Gen) gen_infix_expr(node &ast.InfixExpr) {
 				g.gen_addr_of_expr(node.lhs, key_type)
 				g.sb.write_string('); })')
 			}
+			return
+		}
+		if rhs_type.starts_with('Array_fixed_') {
+			// Fixed-size array: use a linear scan via statement expression.
+			tmp := '_fixed_in_${g.tmp_counter}'
+			g.tmp_counter++
+			g.sb.write_string('({ bool ${tmp} = false; for (int _i = 0; _i < (int)(sizeof(')
+			g.expr(node.rhs)
+			g.sb.write_string(')/sizeof(')
+			g.expr(node.rhs)
+			g.sb.write_string('[0])); _i++) { if (')
+			g.expr(node.rhs)
+			g.sb.write_string('[_i] == ')
+			g.expr(node.lhs)
+			g.sb.write_string(') { ${tmp} = true; break; } } ')
+			if node.op == .not_in {
+				g.sb.write_string('!${tmp}')
+			} else {
+				g.sb.write_string(tmp)
+			}
+			g.sb.write_string('; })')
 			return
 		}
 		if rhs_type == 'array' || rhs_type.starts_with('Array_') {
@@ -1288,6 +1373,48 @@ fn (mut g Gen) gen_infix_expr(node &ast.InfixExpr) {
 				g.sb.write_string(')')
 				return
 			}
+		}
+	}
+	// Comparison operators (<, <=, >, >=) on struct types with overloaded `<` operator.
+	// V derives: a < b → Type__lt(a, b), a > b → Type__lt(b, a),
+	//            a <= b → !Type__lt(b, a), a >= b → !Type__lt(a, b)
+	if node.op in [.lt, .le, .gt, .ge] && lhs_type != '' && rhs_type != ''
+		&& lhs_type == rhs_type && lhs_type !in primitive_types && lhs_type != 'string'
+		&& !lhs_type.ends_with('*') && !lhs_type.ends_with('ptr') {
+		lt_fn := '${lhs_type}__lt'
+		if lt_fn in g.fn_return_types || lt_fn in g.fn_param_is_ptr {
+			match node.op {
+				.lt {
+					g.sb.write_string('${lt_fn}(')
+					g.expr(node.lhs)
+					g.sb.write_string(', ')
+					g.expr(node.rhs)
+					g.sb.write_string(')')
+				}
+				.gt {
+					g.sb.write_string('${lt_fn}(')
+					g.expr(node.rhs)
+					g.sb.write_string(', ')
+					g.expr(node.lhs)
+					g.sb.write_string(')')
+				}
+				.le {
+					g.sb.write_string('!${lt_fn}(')
+					g.expr(node.rhs)
+					g.sb.write_string(', ')
+					g.expr(node.lhs)
+					g.sb.write_string(')')
+				}
+				.ge {
+					g.sb.write_string('!${lt_fn}(')
+					g.expr(node.lhs)
+					g.sb.write_string(', ')
+					g.expr(node.rhs)
+					g.sb.write_string(')')
+				}
+				else {}
+			}
+			return
 		}
 	}
 	is_bitwise_op := node.op in [.amp, .pipe, .xor, .left_shift, .right_shift]
@@ -1812,6 +1939,14 @@ fn (mut g Gen) expr(node ast.Expr) {
 					g.sb.write_string(rhs_name)
 					return
 				}
+				// Generic type parameter access: T.name → string literal with type name
+				if rhs_name == 'name' {
+					if concrete := g.active_generic_types[lhs_name] {
+						type_name := concrete.name()
+						g.sb.write_string('(string){.str = "${type_name}", .len = sizeof("${type_name}") - 1, .is_lit = 1}')
+						return
+					}
+				}
 				if lhs_name in ['bool', 'string', 'int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16',
 					'u32', 'u64', 'f32', 'f64', 'byte', 'rune'] {
 					if enum_name := g.enum_value_to_enum[rhs_name] {
@@ -2032,6 +2167,7 @@ fn (mut g Gen) expr(node ast.Expr) {
 					use_ptr = true
 				} else if local_type := g.local_var_c_type_for_expr(lhs_expr) {
 					use_ptr = local_type.ends_with('*')
+						|| local_type == 'chan'
 				}
 				lhs_struct := g.selector_struct_name(lhs_expr)
 				owner := g.embedded_owner_for(lhs_struct, rhs_name)
@@ -2061,6 +2197,7 @@ fn (mut g Gen) expr(node ast.Expr) {
 					} else if local_type := g.local_var_c_type_for_expr(lhs_expr) {
 						// Local declaration type is authoritative for value vs pointer access.
 						use_ptr = local_type.ends_with('*')
+							|| local_type == 'chan'
 					}
 					lhs_struct := g.selector_struct_name(lhs_expr)
 					owner := g.embedded_owner_for(lhs_struct, rhs_name)

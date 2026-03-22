@@ -646,6 +646,33 @@ fn (g &Gen) generic_key_matches_decl(node ast.FnDecl, key string) bool {
 	return key == node.name || key.starts_with('${node.name}[') || key.contains('.${node.name}[')
 }
 
+// build_generic_spec_index precomputes a reverse index from function names
+// to matching keys in env.generic_types. This avoids O(n*m) iteration
+// in generic_fn_specializations (called per generic fn per file).
+fn (mut g Gen) build_generic_spec_index() {
+	if g.env == unsafe { nil } {
+		return
+	}
+	for key, _ in g.env.generic_types {
+		// Extract the base function name from the key.
+		// Keys can be: "fn_name", "fn_name[T]", "module.fn_name[T]"
+		mut fn_name := key
+		bracket_idx := key.index_u8(`[`)
+		if bracket_idx > 0 {
+			fn_name = key[..bracket_idx]
+		}
+		// If qualified (contains '.'), also index by the short name
+		dot_idx := fn_name.last_index_u8(`.`)
+		if dot_idx > 0 && dot_idx < fn_name.len - 1 {
+			short_name := fn_name[dot_idx + 1..]
+			if short_name.len > 0 {
+				g.generic_spec_index[short_name] << key
+			}
+		}
+		g.generic_spec_index[fn_name] << key
+	}
+}
+
 fn generic_param_names(params []ast.Expr) []string {
 	mut seen := map[string]bool{}
 	mut names := []string{}
@@ -690,10 +717,13 @@ fn (mut g Gen) generic_fn_specializations(node ast.FnDecl) []GenericFnSpecializa
 	}
 	mut specs := []GenericFnSpecialization{}
 	mut seen := map[string]bool{}
-	for key, generic_maps in g.env.generic_types {
+	// Use precomputed index for O(1) lookup instead of iterating all generic types.
+	matching_keys := g.generic_spec_index[node.name]
+	for key in matching_keys {
 		if !g.generic_key_matches_decl(node, key) {
 			continue
 		}
+		generic_maps := g.env.generic_types[key]
 		for generic_types in generic_maps {
 			mut skip_spec := false
 			for param_name in generic_params {
@@ -1184,17 +1214,9 @@ fn (mut g Gen) gen_fn_decl(node ast.FnDecl) {
 }
 
 fn (mut g Gen) gen_fn_decl_ptr(node &ast.FnDecl) {
-	if os.getenv('V2_TRACE_FN_SKIP') != ''
-		&& g.cur_file_name in ['/Users/alexander/code/v/vlib/builtin/map.c.v', '/Users/alexander/code/v/vlib/os/command.c.v', '/Users/alexander/code/v/vlib/os/os_nix.c.v', '/Users/alexander/code/v/vlib/os/os_stat_default.c.v'] {
-		eprintln('TRACE_FN_PTR file=${g.cur_file_name} name=${node.name} lang=${node.language} stmts=${node.stmts.len}')
-	}
 	if !g.should_emit_fn_decl(g.cur_module, *node) {
-		if os.getenv('V2_TRACE_FN_SKIP') != '' {
-			eprintln('TRACE_FN_SKIP should_emit file=${g.cur_file_name} name=${node.name}')
-		}
 		return
 	}
-	// In shared library mode, only emit @[live] function bodies.
 	// All other functions are resolved from the host executable.
 	if g.pref != unsafe { nil } && g.pref.is_shared_lib {
 		if !node.attributes.has('live') {
@@ -1269,9 +1291,6 @@ fn (mut g Gen) gen_fn_decl_ptr(node &ast.FnDecl) {
 
 	fn_name := g.get_fn_name(*node)
 	if fn_name == '' {
-		if os.getenv('V2_TRACE_FN_SKIP') != '' {
-			eprintln('TRACE_FN_SKIP empty_name file=${g.cur_file_name} name=${node.name}')
-		}
 		return
 	}
 	g.gen_fn_decl_with_name_ptr(node, fn_name)
@@ -1286,21 +1305,12 @@ fn (mut g Gen) gen_fn_decl_with_name(node ast.FnDecl, fn_name string) {
 fn (mut g Gen) gen_fn_decl_with_name_ptr(node &ast.FnDecl, fn_name string) {
 	fn_key := 'fn_${fn_name}'
 	if fn_key in g.blocked_fn_keys {
-		if os.getenv('V2_TRACE_FN_SKIP') != '' {
-			eprintln('TRACE_FN_SKIP blocked file=${g.cur_file_name} name=${node.name} fn=${fn_name}')
-		}
 		return
 	}
 	if g.should_skip_plain_v_fallback_fn(fn_key) {
-		if os.getenv('V2_TRACE_FN_SKIP') != '' {
-			eprintln('TRACE_FN_SKIP plain_v_fallback file=${g.cur_file_name} name=${node.name} fn=${fn_name}')
-		}
 		return
 	}
 	if fn_key in g.emitted_types {
-		if os.getenv('V2_TRACE_FN_SKIP') != '' {
-			eprintln('TRACE_FN_SKIP emitted file=${g.cur_file_name} name=${node.name} fn=${fn_name}')
-		}
 		return
 	}
 	g.emitted_types[fn_key] = true
@@ -1417,6 +1427,11 @@ fn (mut g Gen) gen_fn_decl_with_name_ptr(node &ast.FnDecl, fn_name string) {
 				param_type
 			}
 			g.runtime_local_types[param.name] = ptype
+			// Also register under the C-renamed name (e.g. 'array' → '_v_array')
+			// so that body references using the renamed identifier can find the type.
+			if param.name == 'array' {
+				g.runtime_local_types['_v_array'] = ptype
+			}
 		}
 	}
 
@@ -1679,7 +1694,9 @@ fn (mut g Gen) gen_fn_head_with_name_ptr(node &ast.FnDecl, fn_name string) {
 		}
 		g.sb.write_string(t)
 		g.sb.write_string(' ')
-		g.sb.write_string(param.name)
+		// Rename V variables that clash with C type names (matches expr.v Ident handler)
+		pname := if param.name == 'array' { '_v_array' } else { param.name }
+		g.sb.write_string(pname)
 		sig_idx++
 	}
 	g.sb.write_string(')')
@@ -1740,8 +1757,9 @@ fn (mut g Gen) gen_c_extern_forward_decl(node ast.FnDecl) {
 		}
 		g.sb.write_string(t)
 		if param.name != '' {
+			pname := if param.name == 'array' { '_v_array' } else { param.name }
 			g.sb.write_string(' ')
-			g.sb.write_string(param.name)
+			g.sb.write_string(pname)
 		}
 	}
 	if first {
@@ -1953,7 +1971,24 @@ fn (mut g Gen) expr_is_pointer(arg ast.Expr) bool {
 		ast.CastExpr {
 			// The result type of a cast is determined by the target type, not the source.
 			// e.g. u8(ptr) produces u8, not a pointer, even though ptr is a pointer.
-			return g.expr_type_to_c(arg.typ).ends_with('*')
+			target_type := g.expr_type_to_c(arg.typ)
+			if target_type.ends_with('*') {
+				return true
+			}
+			// For C typedef struct casts like C.log__Logger(ptr), if the source is a pointer,
+			// the result is also a pointer (type pun cast). The cast doesn't unwrap the pointer.
+			if target_type.contains('__') && g.expr_is_pointer(arg.expr) {
+				return true
+			}
+			return false
+		}
+		ast.CallOrCastExpr {
+			// When the LHS is a type (not a function), this is a type cast.
+			// In V, C.Type(ptr) where ptr is a pointer means "treat as Type*",
+			// so the result is still a pointer.
+			if g.call_or_cast_lhs_is_type(arg.lhs) {
+				return g.expr_is_pointer(arg.expr)
+			}
 		}
 		ast.Ident {
 			if arg.name == 'nil' {
@@ -1965,7 +2000,7 @@ fn (mut g Gen) expr_is_pointer(arg ast.Expr) bool {
 				if arg.name in g.cur_fn_mut_params {
 					return true
 				}
-				return local_type.ends_with('*') || local_type in ['voidptr', 'charptr', 'byteptr']
+				return local_type.ends_with('*') || local_type in ['voidptr', 'charptr', 'byteptr', 'chan']
 			}
 			if arg.name in g.cur_fn_mut_params {
 				return true
@@ -2071,6 +2106,22 @@ fn (mut g Gen) can_take_address(arg ast.Expr) bool {
 			return false
 		}
 	}
+}
+
+// is_simple_addressable returns true if the expression is cheap to re-evaluate
+// (e.g., an identifier or field access), unlike a function call which has side effects
+// and generates significant code.
+fn (g &Gen) is_simple_addressable(expr ast.Expr) bool {
+	if expr is ast.Ident {
+		return true
+	}
+	if expr is ast.SelectorExpr {
+		return g.is_simple_addressable(expr.lhs)
+	}
+	if expr is ast.ParenExpr {
+		return g.is_simple_addressable(expr.expr)
+	}
+	return false
 }
 
 fn (mut g Gen) gen_addr_of_expr(arg ast.Expr, typ string) {
@@ -2186,6 +2237,44 @@ fn (mut g Gen) fn_return_type_to_c(t types.Type) string {
 
 fn (mut g Gen) is_fn_pointer_expr(expr ast.Expr) bool {
 	return g.fn_pointer_return_type(expr) != ''
+}
+
+// fn_pointer_param_is_ptr extracts parameter pointer-ness from a fn-pointer type.
+// Returns an array of bools (true = param expects pointer, false = by value).
+fn (mut g Gen) fn_pointer_param_is_ptr(expr ast.Expr) []bool {
+	raw_type := g.get_raw_type(expr) or { return []bool{} }
+	fn_type := match raw_type {
+		types.FnType {
+			raw_type
+		}
+		types.Alias {
+			if raw_type.base_type is types.FnType {
+				raw_type.base_type as types.FnType
+			} else {
+				return []bool{}
+			}
+		}
+		types.Pointer {
+			if raw_type.base_type is types.FnType {
+				raw_type.base_type as types.FnType
+			} else if raw_type.base_type is types.Alias
+				&& raw_type.base_type.base_type is types.FnType {
+				raw_type.base_type.base_type as types.FnType
+			} else {
+				return []bool{}
+			}
+		}
+		else {
+			return []bool{}
+		}
+	}
+	param_types := fn_type.get_param_types()
+	mut result := []bool{cap: param_types.len}
+	for pt in param_types {
+		c_name := g.types_type_to_c(pt)
+		result << (c_name.ends_with('*') || pt is types.Pointer)
+	}
+	return result
 }
 
 fn (mut g Gen) should_auto_deref(arg ast.Expr) bool {
@@ -2468,6 +2557,70 @@ fn (mut g Gen) gen_call_arg(fn_name string, idx int, arg ast.Expr) {
 				g.sb.write_string('((array){ .data = &(string[1]){')
 				g.expr(base_arg)
 				g.sb.write_string('}, .offset = 0, .len = 1, .cap = 1, .flags = 0, .element_size = sizeof(string) })')
+				return
+			}
+		}
+	}
+	// Detect bound method references: b.method_name passed as a fn pointer arg.
+	// Generate a static trampoline function + __thread capture variable.
+	// Only applies when the expected parameter is a function pointer type.
+	if base_arg is ast.SelectorExpr {
+		receiver_type := g.get_expr_type(base_arg.lhs).trim_right('*')
+		if receiver_type != '' && base_arg.rhs.name != '' {
+			// Check if the expected parameter type is a function pointer.
+			// If not, this is a struct field access (e.g., s.str, w.id), not a method value.
+			mut param_is_fn_ptr := false
+			if param_types := g.fn_param_types[fn_name] {
+				if idx < param_types.len {
+					pt := param_types[idx]
+					param_is_fn_ptr = pt.contains('(*)') || g.is_fn_pointer_alias_type(pt)
+				}
+			}
+			method_c_name := '${receiver_type}__${base_arg.rhs.name}'
+			if param_is_fn_ptr
+				&& (method_c_name in g.fn_param_is_ptr || method_c_name in g.fn_return_types) {
+				tramp_name := '__bound_method_${receiver_type}__${base_arg.rhs.name}'
+				if tramp_name !in g.emitted_trampolines {
+					g.emitted_trampolines[tramp_name] = true
+					// Build trampoline function as a string and add to deferred defs
+					ret_type := g.fn_return_types[method_c_name] or { 'void' }
+					param_is_ptr := g.fn_param_is_ptr[method_c_name] or { []bool{} }
+					param_types := g.fn_param_types[method_c_name] or { []string{} }
+					recv_is_ptr := if param_is_ptr.len > 0 { param_is_ptr[0] } else { false }
+					recv_var := '__bound_recv_${receiver_type}__${base_arg.rhs.name}'
+					mut def := 'static __thread ${receiver_type}* ${recv_var};\n'
+					def += 'static ${ret_type} ${tramp_name}('
+					for pi in 1 .. param_types.len {
+						if pi > 1 {
+							def += ', '
+						}
+						def += '${param_types[pi]} _p${pi}'
+					}
+					def += ') {\n\t'
+					if ret_type != 'void' {
+						def += 'return '
+					}
+					if recv_is_ptr {
+						def += '${method_c_name}(${recv_var}'
+					} else {
+						def += '${method_c_name}(*${recv_var}'
+					}
+					for pi in 1 .. param_types.len {
+						def += ', _p${pi}'
+					}
+					def += ');\n}\n'
+					g.trampoline_defs << def
+				}
+				// Set capture variable and pass trampoline
+				recv_var := '__bound_recv_${receiver_type}__${base_arg.rhs.name}'
+				g.sb.write_string('(${recv_var} = ')
+				if g.expr_is_pointer(base_arg.lhs) {
+					g.expr(base_arg.lhs)
+				} else {
+					g.sb.write_string('&')
+					g.expr(base_arg.lhs)
+				}
+				g.sb.write_string(', ${tramp_name})')
 				return
 			}
 		}
@@ -3496,6 +3649,10 @@ fn (mut g Gen) call_expr(lhs ast.Expr, args []ast.Expr) {
 	if name == 'os__exit' {
 		name = 'exit'
 	}
+	// chan type methods map to sync__Channel__ methods
+	if name.starts_with('chan__') {
+		name = 'sync__Channel__' + name['chan__'.len..]
+	}
 	// strings__Builder methods are emitted directly by cheaders.v;
 	// do NOT fall back to array__ methods which have different signatures.
 	if name.starts_with('array__') && call_args.len > 0 {
@@ -3891,6 +4048,12 @@ fn (mut g Gen) call_expr(lhs ast.Expr, args []ast.Expr) {
 			total_args = params.len
 		}
 	}
+	// For fn-pointer local variable calls, pre-compute param pointer info
+	// so we can auto-deref mut params when the fn type expects by-value.
+	mut fnptr_param_is_ptr := []bool{}
+	if is_local_call && c_name !in g.fn_param_is_ptr {
+		fnptr_param_is_ptr = g.fn_pointer_param_is_ptr(lhs)
+	}
 	for i in 0 .. total_args {
 		if i > 0 {
 			g.sb.write_string(', ')
@@ -3905,6 +4068,25 @@ fn (mut g Gen) call_expr(lhs ast.Expr, args []ast.Expr) {
 				g.expr(call_args[i])
 				g.sb.write_string(')')
 				continue
+			}
+			// For fn-pointer calls, auto-deref mut params when the fn type expects by-value
+			if fnptr_param_is_ptr.len > 0 && i < fnptr_param_is_ptr.len
+				&& !fnptr_param_is_ptr[i] {
+				arg := call_args[i]
+				mut arg_ident_name := ''
+				if arg is ast.ModifierExpr {
+					if arg.expr is ast.Ident {
+						arg_ident_name = arg.expr.name
+					}
+				} else if arg is ast.Ident {
+					arg_ident_name = arg.name
+				}
+				if arg_ident_name != '' && arg_ident_name in g.cur_fn_mut_params {
+					g.sb.write_string('(*')
+					g.sb.write_string(arg_ident_name)
+					g.sb.write_string(')')
+					continue
+				}
 			}
 			g.gen_call_arg(c_name, i, call_args[i])
 		} else {

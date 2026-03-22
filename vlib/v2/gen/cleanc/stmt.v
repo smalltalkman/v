@@ -298,11 +298,24 @@ fn (mut g Gen) gen_stmt(node ast.Stmt) {
 				if value_type in g.sum_type_variants {
 					g.gen_type_cast_expr(value_type, expr)
 				} else if g.is_interface_type(value_type) {
-					if !g.gen_interface_cast(value_type, expr) {
+					// Mut params are pointers — dereference when returning as value
+					if expr is ast.Ident && expr.name in g.cur_fn_mut_params {
+						g.sb.write_string('(*')
+						g.expr(expr)
+						g.sb.write_string(')')
+					} else if !g.gen_interface_cast(value_type, expr) {
 						g.expr(expr)
 					}
 				} else {
-					g.expr(expr)
+					// Dereference mut parameters when returning by value in result-wrapping
+					// (mut params are pointers, but _val expects a value)
+					if expr is ast.Ident && expr.name in g.cur_fn_mut_params {
+						g.sb.write_string('(*')
+						g.expr(expr)
+						g.sb.write_string(')')
+					} else {
+						g.expr(expr)
+					}
 				}
 				g.sb.writeln('; _result_ok(&_val, (_result*)&_res, sizeof(_val)); _res; });')
 				return
@@ -319,6 +332,13 @@ fn (mut g Gen) gen_stmt(node ast.Stmt) {
 					} else {
 						g.gen_type_cast_expr(g.cur_fn_ret_type, expr)
 					}
+				} else if g.cur_fn_ret_type.ends_with('*') && expr is ast.ParenExpr
+					&& expr.expr is ast.PrefixExpr && (expr.expr as ast.PrefixExpr).op == .mul {
+					// Return type is a pointer but the expression dereferences a pointer
+					// (e.g., interface smartcast: *(T*)(obj._object)). Strip the deref
+					// to return the pointer directly.
+					deref := expr.expr as ast.PrefixExpr
+					g.expr(deref.expr)
 				} else {
 					g.expr(expr)
 				}

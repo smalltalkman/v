@@ -1865,6 +1865,40 @@ fn (mut t Transformer) transform_stmts(stmts []ast.Stmt) []ast.Stmt {
 	for stmt in stmts {
 		// Check for OrExpr assignment that expands to multiple statements
 		if stmt is ast.AssignStmt {
+			// Expand comptime $if assignment: `mut res := $if flag ? { expr1 } $else { stmts... ; expr_n }`
+			// When the selected branch has multiple statements, inline the statements and use
+			// the last expression as the assignment RHS.
+			if stmt.rhs.len == 1 && stmt.rhs[0] is ast.ComptimeExpr {
+				comptime_expr := stmt.rhs[0] as ast.ComptimeExpr
+				if comptime_expr.expr is ast.IfExpr {
+					selected := t.resolve_comptime_if_stmts(comptime_expr.expr as ast.IfExpr)
+					if selected.len > 0 {
+						// Inline all but the last statement
+						for i := 0; i < selected.len - 1; i++ {
+							t.append_transformed_stmt(mut result, selected[i])
+						}
+						// Use the last statement's expression as the assignment RHS
+						last_stmt := selected[selected.len - 1]
+						if last_stmt is ast.ExprStmt {
+							t.append_transformed_stmt(mut result, ast.Stmt(ast.AssignStmt{
+								op:  stmt.op
+								lhs: stmt.lhs
+								rhs: [t.transform_expr(last_stmt.expr)]
+								pos: stmt.pos
+							}))
+							continue
+						} else if last_stmt is ast.AssignStmt {
+							t.append_transformed_stmt(mut result, ast.Stmt(ast.AssignStmt{
+								op:  stmt.op
+								lhs: stmt.lhs
+								rhs: last_stmt.rhs
+								pos: stmt.pos
+							}))
+							continue
+						}
+					}
+				}
+			}
 			// Native backends (arm64/x64): lower interface casts.
 			// `shape1 := Shape(rect)` → `shape1 := rect` and record concrete type mapping.
 			if is_native_be && stmt.rhs.len == 1 && stmt.lhs.len == 1 && stmt.lhs[0] is ast.Ident
@@ -3469,6 +3503,10 @@ fn (mut t Transformer) gen_filter_temp_name() string {
 // to t.pending_stmts, and returns the temp variable ident as the replacement expression.
 fn (mut t Transformer) try_expand_filter_or_map_expr(expr ast.Expr) ?ast.Expr {
 	method_name, receiver_expr, body_expr := t.get_filter_or_map_call_info(expr) or { return none }
+	// Handle .any() and .all() — expand to bool result + for loop with break
+	if method_name in ['any', 'all'] {
+		return t.expand_any_or_all_expr(method_name, receiver_expr, body_expr)
+	}
 	// Get the array type from the receiver
 	array_type := t.get_array_type_str(receiver_expr) or { return none }
 	elem_type := array_type['Array_'.len..]
@@ -3710,6 +3748,120 @@ fn (mut t Transformer) try_expand_filter_or_map_expr(expr ast.Expr) ?ast.Expr {
 	return temp_ident
 }
 
+// expand_any_or_all_expr expands array.any(cond) / array.all(cond) calls.
+// .any(cond) → bool _filter_tN = false; for _filter_itN in arr { if cond { _filter_tN = true; break; } }
+// .all(cond) → bool _filter_tN = true; for _filter_itN in arr { if !cond { _filter_tN = false; break; } }
+fn (mut t Transformer) expand_any_or_all_expr(method_name string, receiver_expr ast.Expr, body_expr ast.Expr) ?ast.Expr {
+	is_any := method_name == 'any'
+	temp_name := t.gen_filter_temp_name()
+	temp_ident := ast.Ident{
+		name: temp_name
+	}
+	it_ident := ast.Ident{
+		name: '_filter_it${t.temp_counter}'
+	}
+	// bool _filter_tN = false (any) / true (all)
+	init_val := if is_any {
+		ast.Expr(ast.BasicLiteral{
+			kind:  .key_false
+			value: 'false'
+		})
+	} else {
+		ast.Expr(ast.BasicLiteral{
+			kind:  .key_true
+			value: 'true'
+		})
+	}
+	init_stmt := ast.Stmt(ast.AssignStmt{
+		op:  .decl_assign
+		lhs: [ast.Expr(ast.ModifierExpr{
+			kind: .key_mut
+			expr: temp_ident
+		})]
+		rhs: [init_val]
+	})
+	// Replace 'it' with '_filter_itN' in the body expression
+	transformed_body := t.replace_it_ident(body_expr, it_ident.name)
+	// Build condition: for any, use cond directly; for all, negate it
+	cond := if is_any {
+		transformed_body
+	} else {
+		ast.Expr(ast.PrefixExpr{
+			op:   .not
+			expr: transformed_body
+		})
+	}
+	// The value to assign on match: true for any, false for all
+	assign_val := if is_any {
+		ast.Expr(ast.BasicLiteral{
+			kind:  .key_true
+			value: 'true'
+		})
+	} else {
+		ast.Expr(ast.BasicLiteral{
+			kind:  .key_false
+			value: 'false'
+		})
+	}
+	// Build loop body: if cond { _filter_tN = true/false; break; }
+	loop_body := [
+		ast.Stmt(ast.ExprStmt{
+			expr: ast.IfExpr{
+				cond:  cond
+				stmts: [
+					ast.Stmt(ast.AssignStmt{
+						op:  .assign
+						lhs: [ast.Expr(temp_ident)]
+						rhs: [assign_val]
+					}),
+					ast.Stmt(ast.FlowControlStmt{
+						op: .key_break
+					}),
+				]
+			}
+		}),
+	]
+	// Cache complex receiver expressions
+	mut receiver_for_loop := receiver_expr
+	mut has_cache_stmt := false
+	mut cache_stmt := ast.empty_stmt
+	if receiver_expr !is ast.Ident && receiver_expr !is ast.SelectorExpr {
+		transformed_receiver := t.transform_expr(receiver_expr)
+		cache_name := '_filter_recv${t.temp_counter}'
+		cache_ident := ast.Ident{
+			name: cache_name
+		}
+		if recv_type := t.get_expr_type(receiver_expr) {
+			t.register_temp_var(cache_name, recv_type)
+		}
+		cache_stmt = ast.Stmt(ast.AssignStmt{
+			op:  .decl_assign
+			lhs: [ast.Expr(cache_ident)]
+			rhs: [transformed_receiver]
+		})
+		has_cache_stmt = true
+		receiver_for_loop = cache_ident
+	}
+	for_stmt := ast.Stmt(ast.ForStmt{
+		init:  ast.ForInStmt{
+			value: it_ident
+			expr:  receiver_for_loop
+		}
+		stmts: loop_body
+	})
+	saved_pending := t.pending_stmts.clone()
+	t.pending_stmts.clear()
+	transformed_init := t.transform_stmt(init_stmt)
+	transformed_for := t.transform_stmt(for_stmt)
+	t.pending_stmts = saved_pending
+	if has_cache_stmt {
+		t.pending_stmts << cache_stmt
+	}
+	t.pending_stmts << transformed_init
+	t.pending_stmts << transformed_for
+	return temp_ident
+}
+
 // get_filter_or_map_call_info extracts info from a filter/map method call.
 // Returns (method_name, receiver_expr, body_expr) or none if not a filter/map call.
 fn (t &Transformer) get_filter_or_map_call_info(expr ast.Expr) ?(string, ast.Expr, ast.Expr) {
@@ -3718,7 +3870,7 @@ fn (t &Transformer) get_filter_or_map_call_info(expr ast.Expr) ?(string, ast.Exp
 		if expr.lhs is ast.SelectorExpr {
 			sel := expr.lhs as ast.SelectorExpr
 			method_name := sel.rhs.name
-			if method_name in ['filter', 'map'] {
+			if method_name in ['filter', 'map', 'any', 'all'] {
 				return method_name, sel.lhs, expr.expr
 			}
 		}
@@ -3728,7 +3880,7 @@ fn (t &Transformer) get_filter_or_map_call_info(expr ast.Expr) ?(string, ast.Exp
 		if expr.lhs is ast.SelectorExpr {
 			sel := expr.lhs as ast.SelectorExpr
 			method_name := sel.rhs.name
-			if method_name in ['filter', 'map'] && expr.args.len == 1 {
+			if method_name in ['filter', 'map', 'any', 'all'] && expr.args.len == 1 {
 				return method_name, sel.lhs, expr.args[0]
 			}
 		}
@@ -4014,7 +4166,37 @@ fn (t &Transformer) or_block_has_return(stmts []ast.Stmt) bool {
 					return true
 				}
 			}
+			// Check for if-expression where all branches diverge
+			// e.g., if cond { continue } else { return err }
+			if stmt.expr is ast.IfExpr {
+				if t.if_expr_all_branches_diverge(stmt.expr as ast.IfExpr) {
+					return true
+				}
+			}
 		}
+	}
+	return false
+}
+
+// if_expr_all_branches_diverge checks if every branch of an if-expression
+// contains a return, continue, break, or other diverging control flow.
+// Used to detect or-blocks like: if cond { continue } else { return err }
+fn (t &Transformer) if_expr_all_branches_diverge(expr ast.IfExpr) bool {
+	// Plain else block: cond is EmptyExpr, just check its stmts
+	if expr.cond is ast.EmptyExpr {
+		return t.or_block_has_return(expr.stmts)
+	}
+	// Check the then-branch
+	if !t.or_block_has_return(expr.stmts) {
+		return false
+	}
+	// Must have an else branch, otherwise the if might fall through
+	if expr.else_expr is ast.EmptyExpr {
+		return false
+	}
+	// else-if chain or plain else: recurse into the nested IfExpr
+	if expr.else_expr is ast.IfExpr {
+		return t.if_expr_all_branches_diverge(expr.else_expr as ast.IfExpr)
 	}
 	return false
 }
@@ -4635,22 +4817,7 @@ fn (mut t Transformer) expand_single_or_expr(or_expr ast.OrExpr, mut prefix_stmt
 	}
 	is_void_result := base_type == '' || base_type == 'void'
 	// 1. _t1 := call_expr
-	if t.cur_fn_name_str.contains('get_or_panic') {
-		is_coc := call_expr is ast.CallOrCastExpr
-		is_call := call_expr is ast.CallExpr
-		is_ident := call_expr is ast.Ident
-		eprintln('DEBUG expand_single: call_expr is_coc=${is_coc} is_call=${is_call} is_ident=${is_ident} fn_name=${fn_name} base_type=${base_type} is_result=${is_result}')
-		if is_coc {
-			coc := call_expr as ast.CallOrCastExpr
-			lhs_is_ga := coc.lhs is ast.GenericArgs
-			expr_is_id := coc.expr is ast.Ident
-			eprintln('  lhs_is_ga=${lhs_is_ga} expr_is_id=${expr_is_id}')
-		}
-	}
 	transformed_call2 := t.transform_expr(call_expr)
-	if t.cur_fn_name_str.contains('get_or_panic') {
-		eprintln('DEBUG expand_single: transformed name=${transformed_call2.name()}')
-	}
 	// For string range or-blocks, rename string__substr to string__substr_with_check
 	// which returns !string (Result) instead of string.
 	rhs_expr2 := if is_string_range_or {
@@ -4734,7 +4901,20 @@ fn (mut t Transformer) expand_single_or_expr(or_expr ast.OrExpr, mut prefix_stmt
 		// For void results, return an empty expression since there's no value
 		return ast.empty_expr
 	}
-	return t.synth_selector(temp_ident, 'data', types.Type(types.voidptr_))
+	// Use the actual unwrapped base type for the .data selector, so that
+	// downstream code (e.g., array_value_elem_type) can detect the type
+	// correctly. Falls back to voidptr if the type is not available.
+	mut data_type := types.Type(types.voidptr_)
+	if t.fn_root_scope != unsafe { nil } {
+		if temp_obj_type := t.fn_root_scope.lookup_var_type(temp_name) {
+			if temp_obj_type is types.ResultType {
+				data_type = temp_obj_type.base_type
+			} else if temp_obj_type is types.OptionType {
+				data_type = temp_obj_type.base_type
+			}
+		}
+	}
+	return t.synth_selector(temp_ident, 'data', data_type)
 }
 
 // typed_deref generates a typed dereference of a voidptr:
@@ -7258,6 +7438,24 @@ fn (t &Transformer) get_array_method_info(expr ast.Expr) ?ArrayMethodInfo {
 	if elem_type_name := t.get_array_elem_type_str(expr) {
 		if elem_type_name == '' || elem_type_name == 'void' {
 			return none
+		}
+		// Check if the expression's C type name indicates a fixed array.
+		// get_array_elem_type_str loses fixed-array info, so recover it here.
+		if expr is ast.Ident {
+			var_type := t.get_var_type_name(expr.name)
+			c_type := t.v_type_name_to_c_name(var_type)
+			if c_type.starts_with('Array_fixed_') {
+				payload := c_type['Array_fixed_'.len..]
+				if payload.contains('_') {
+					len_str := payload.all_after_last('_')
+					return ArrayMethodInfo{
+						array_type: c_type
+						elem_type:  elem_type_name
+						is_fixed:   true
+						fixed_len:  len_str.int()
+					}
+				}
+			}
 		}
 		return ArrayMethodInfo{
 			array_type: 'Array_${elem_type_name}'

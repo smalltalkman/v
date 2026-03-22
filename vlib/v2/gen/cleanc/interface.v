@@ -33,7 +33,10 @@ fn (mut g Gen) interface_method_info_from_ast(name string, fn_type ast.FnType) I
 	mut param_types := []string{}
 	mut cast_sig := '${ret} (*)(void*'
 	for param in fn_type.params {
-		t := g.expr_type_to_c(param.typ)
+		mut t := g.expr_type_to_c(param.typ)
+		if param.is_mut && !t.ends_with('*') {
+			t += '*'
+		}
 		cast_sig += ', ${t}'
 		param_types << t
 	}
@@ -435,6 +438,29 @@ fn (mut g Gen) interface_fields_resolved(node ast.InterfaceDecl) bool {
 		}
 	}
 	return true
+}
+
+// resolve_embedded_method checks if a method exists on an embedded struct type.
+// For example, ssl__SSLConn embeds openssl__SSLConn, so ssl__SSLConn__addr
+// resolves to openssl__SSLConn__addr.
+fn (mut g Gen) resolve_embedded_method(struct_name string, method_name string) string {
+	st := g.lookup_struct_type_by_c_name(struct_name)
+	for emb in st.embedded {
+		emb_c_name := g.types_type_to_c(types.Type(emb))
+		if emb_c_name == '' {
+			continue
+		}
+		candidate := '${emb_c_name}__${method_name}'
+		if candidate in g.fn_param_is_ptr || candidate in g.fn_return_types {
+			return candidate
+		}
+		// Recurse into nested embeddings
+		nested := g.resolve_embedded_method(emb_c_name, method_name)
+		if nested != '' {
+			return nested
+		}
+	}
+	return ''
 }
 
 fn (mut g Gen) resolve_embedded_interface_fields(emb_name string) ?[]ast.FieldDecl {

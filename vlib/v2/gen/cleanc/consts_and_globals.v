@@ -300,7 +300,8 @@ fn (mut g Gen) gen_const_decl_extern(node ast.ConstDecl) {
 		name := g.generated_decl_name(field.name) or { continue }
 		// Skip consts that shadow a function with the same name — the
 		// function declaration takes precedence and a #define would break it.
-		if name in g.fn_return_types {
+		// Only skip when a forward declaration was actually emitted (fn_owner_file).
+		if 'fn_${name}' in g.fn_owner_file {
 			continue
 		}
 		// Skip constants already emitted as either extern or #define
@@ -543,8 +544,14 @@ fn (g &Gen) module_has_const_init_fn(module_name string) bool {
 fn (mut g Gen) gen_const_decl(node ast.ConstDecl) {
 	for field in node.fields {
 		name := g.generated_decl_name(field.name) or { continue }
-		// Skip consts that shadow a function with the same name.
-		if name in g.fn_return_types {
+		// Skip consts that shadow a function with the same name —
+		// but only when a forward declaration was actually emitted
+		// for that function (fn_owner_file is populated in pass 4).
+		// Using fn_return_types alone is too broad: generic functions
+		// like math.max[f64] register math__max_f64 in fn_return_types
+		// but never emit a concrete function, falsely suppressing
+		// the math__max_f64 constant.
+		if 'fn_${name}' in g.fn_owner_file {
 			continue
 		}
 		const_key := 'const_${name}'

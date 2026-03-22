@@ -7,7 +7,6 @@ module cleanc
 import v2.ast
 import v2.pref
 import v2.types
-import os
 import strings
 import time
 
@@ -82,11 +81,14 @@ mut:
 	force_emit_fn_names   map[string]bool   // function C names that must be emitted regardless of mark_used
 	export_fn_names       map[string]string // V-qualified name → export name (from @[export:] attribute)
 	called_fn_names       map[string]bool
-	anon_fn_defs          []string        // lifted anonymous function definitions
+	generic_spec_index    map[string][]string // fn_name → matching keys in env.generic_types
+	anon_fn_defs          []string            // lifted anonymous function definitions
 	pass5_start_pos       int             // position in sb where pass 5 starts
 	deferred_m_includes   []string        // Objective-C .m file #include lines deferred until after type definitions
 	spawned_fns           map[string]bool // spawn wrapper names already emitted
 	spawn_wrapper_defs    []string        // spawn wrapper struct + function definitions
+	emitted_trampolines   map[string]bool    // bound method trampoline names already emitted
+	trampoline_defs       []string           // bound method trampoline definitions
 	// @[live] hot code reloading
 	live_fns         []LiveFnInfo    // @[live] functions detected during code generation
 	live_source_file string          // source file containing @[live] functions
@@ -234,6 +236,10 @@ fn (mut g Gen) gen_file(file ast.File) {
 		g.gen_global_decl((*stmt_ptr) as ast.GlobalDecl)
 	}
 	for fi in fn_indices {
+		// Re-set file/module context before each function body emission,
+		// because body generation can modify g.cur_file_name and g.cur_module
+		// (e.g. via find_generic_fn_decl_by_base_name, resolve_method_on_embedded_decl).
+		g.set_file_module(file)
 		stmt_ptr := &file.stmts[fi]
 		fn_decl_ptr := &((*stmt_ptr) as ast.FnDecl)
 		g.gen_fn_decl_ptr(fn_decl_ptr)
@@ -506,10 +512,26 @@ pub fn (mut g Gen) gen_passes_1_to_4() {
 	g.collect_module_type_names()
 	g.collect_runtime_aliases()
 	g.collect_generic_struct_bindings()
+	// Force eventbus generic structs to use T=string binding.
+	// Without full monomorphization, eventbus methods assume T=string
+	// (see fn.v hardcoded eventbus workaround).
+	string_binding := {
+		'T': types.Type(types.string_)
+	}
+	for eb_name in ['eventbus__EventHandler', 'eventbus__EventBus', 'eventbus__Publisher',
+		'eventbus__Subscriber', 'eventbus__Registry'] {
+		g.generic_struct_bindings[eb_name] = string_binding.clone()
+	}
+	// Force stdatomic AtomicVal to T=f64 (methods use f64 return/param types,
+	// but struct binding may have been set to a user-defined struct type).
+	g.generic_struct_bindings['stdatomic__AtomicVal'] = {
+		'T': types.Type(types.f64_)
+	}
 	g.collect_fn_signatures()
 	g.collect_c_file_fn_keys()
 	g.collect_runtime_const_targets()
 	g.register_builder_methods()
+	g.build_generic_spec_index()
 	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
 		'setup')
 
@@ -1041,7 +1063,7 @@ pub fn (mut g Gen) gen_finalize() string {
 	g.emit_exported_const_symbols()
 
 	mut out := ''
-	if g.anon_fn_defs.len > 0 || g.spawn_wrapper_defs.len > 0 {
+	if g.anon_fn_defs.len > 0 || g.spawn_wrapper_defs.len > 0 || g.trampoline_defs.len > 0 {
 		full := g.sb.str()
 		mut out_sb := strings.new_builder(full.len + 4096)
 		unsafe { out_sb.write_ptr(full.str, g.pass5_start_pos) }
@@ -1056,15 +1078,15 @@ pub fn (mut g Gen) gen_finalize() string {
 		for def in g.anon_fn_defs {
 			out_sb.write_string(def)
 		}
+		for def in g.trampoline_defs {
+			out_sb.write_string(def)
+		}
 		if g.pass5_start_pos < full.len {
 			unsafe { out_sb.write_ptr(full.str + g.pass5_start_pos, full.len - g.pass5_start_pos) }
 		}
 		out = out_sb.str()
 	} else {
 		out = g.sb.str()
-	}
-	if os.getenv('V2TRACE_CLEANC') != '' {
-		eprintln('TRACE_CLEANC sb_len=${g.sb.len} out_len=${out.len} files=${g.files.len}')
 	}
 	return out
 }
@@ -1134,7 +1156,7 @@ pub fn (mut g Gen) gen_pass5_files(file_indices []int) {
 // file_indices specifies which files this worker will process.
 // Functions owned by files outside this range are pre-marked as emitted
 // to prevent duplicate emission across workers.
-pub fn (g &Gen) new_pass5_worker(file_indices []int) &Gen {
+pub fn (g &Gen) new_pass5_worker(file_indices []int, worker_id int) &Gen {
 	// Build a set of file indices this worker owns
 	mut owned_files := map[int]bool{}
 	for fi in file_indices {
@@ -1192,8 +1214,12 @@ pub fn (g &Gen) new_pass5_worker(file_indices []int) &Gen {
 		force_emit_fn_names:         g.force_emit_fn_names.clone()
 		export_fn_names:             g.export_fn_names.clone()
 		called_fn_names:             g.called_fn_names.clone()
+		generic_spec_index:          g.generic_spec_index.clone()
 		typedef_c_types:             g.typedef_c_types.clone()
-		// Per-worker mutable state (starts fresh)
+		// Per-worker mutable state (starts fresh).
+		// Each worker gets a unique tmp_counter offset to avoid name collisions
+		// for generated trampolines (_bound_method_N, _bound_recv_N, etc.).
+		tmp_counter:                 (worker_id + 1) * 100_000
 		emitted_types:               worker_emitted
 		blocked_fn_keys:             blocked_fn_keys
 		runtime_local_types:         map[string]string{}
@@ -1227,6 +1253,7 @@ pub fn (mut g Gen) merge_pass5_worker(w &Gen) {
 		g.live_source_file = w.live_source_file
 	}
 	g.spawn_wrapper_defs << w.spawn_wrapper_defs
+	g.trampoline_defs << w.trampoline_defs
 	g.exported_const_symbols << w.exported_const_symbols
 	// Merge accumulator maps
 	for k, v in w.needed_interface_wrappers {

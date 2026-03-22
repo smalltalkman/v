@@ -446,6 +446,21 @@ fn (t &Transformer) expr_returns_option(expr ast.Expr) bool {
 	if wrapper_type := t.expr_wrapper_type_for_or(expr) {
 		return wrapper_type is types.OptionType
 	}
+	// Fallback: check if the call target is a function pointer variable with Option return type.
+	if expr is ast.CallExpr || expr is ast.CallOrCastExpr {
+		mut call_lhs := ast.empty_expr
+		if expr is ast.CallExpr {
+			call_lhs = expr.lhs
+		} else if expr is ast.CallOrCastExpr {
+			call_lhs = expr.lhs
+		}
+		if call_lhs is ast.Ident {
+			lhs_ident := call_lhs as ast.Ident
+			if var_type := t.lookup_var_type(lhs_ident.name) {
+				return t.fn_type_returns_option(var_type)
+			}
+		}
+	}
 	return false
 }
 
@@ -457,6 +472,59 @@ fn (t &Transformer) expr_returns_result(expr ast.Expr) bool {
 	}
 	if typ := t.get_expr_type(expr) {
 		return typ is types.ResultType
+	}
+	// Fallback: check if the call target is a function pointer variable with Result return type.
+	// This handles cases like `if r := fn_ptr_var(args)` where the type checker didn't
+	// annotate the call expression but the variable's FnType has the return type info.
+	if expr is ast.CallExpr || expr is ast.CallOrCastExpr {
+		mut call_lhs := ast.empty_expr
+		if expr is ast.CallExpr {
+			call_lhs = expr.lhs
+		} else if expr is ast.CallOrCastExpr {
+			call_lhs = expr.lhs
+		}
+		if call_lhs is ast.Ident {
+			lhs_ident := call_lhs as ast.Ident
+			if var_type := t.lookup_var_type(lhs_ident.name) {
+				return t.fn_type_returns_result(var_type)
+			}
+		}
+	}
+	return false
+}
+
+fn (t &Transformer) fn_type_returns_result(typ types.Type) bool {
+	match typ {
+		types.FnType {
+			if ret := typ.get_return_type() {
+				return ret is types.ResultType
+			}
+		}
+		types.Alias {
+			return t.fn_type_returns_result(typ.base_type)
+		}
+		types.Pointer {
+			return t.fn_type_returns_result(typ.base_type)
+		}
+		else {}
+	}
+	return false
+}
+
+fn (t &Transformer) fn_type_returns_option(typ types.Type) bool {
+	match typ {
+		types.FnType {
+			if ret := typ.get_return_type() {
+				return ret is types.OptionType
+			}
+		}
+		types.Alias {
+			return t.fn_type_returns_option(typ.base_type)
+		}
+		types.Pointer {
+			return t.fn_type_returns_option(typ.base_type)
+		}
+		else {}
 	}
 	return false
 }
@@ -608,13 +676,24 @@ fn (mut t Transformer) is_void_call_expr(expr ast.Expr) bool {
 		}
 		return true // Return type is void
 	}
-	// Check using fn return type lookup
-	if ret := t.get_fn_return_type(fn_name) {
-		ret_name := ret.name()
-		if ret_name != '' && ret_name != 'void' && ret_name != 'Void' {
-			return false
+	// For method calls (SelectorExpr LHS), don't fall back to fn_return_type lookup
+	// since the short method name may conflict with a builtin function.
+	// e.g. `logger.error(...)` has fn_name='error' which matches builtin `error()`.
+	mut is_method_call := false
+	if expr is ast.CallExpr && expr.lhs is ast.SelectorExpr {
+		is_method_call = true
+	} else if expr is ast.CallOrCastExpr && expr.lhs is ast.SelectorExpr {
+		is_method_call = true
+	}
+	if !is_method_call {
+		// Check using fn return type lookup
+		if ret := t.get_fn_return_type(fn_name) {
+			ret_name := ret.name()
+			if ret_name != '' && ret_name != 'void' && ret_name != 'Void' {
+				return false
+			}
+			return true
 		}
-		return true
 	}
 	// No return type found — likely a void function
 	return true
@@ -751,8 +830,29 @@ fn (mut t Transformer) transform_fn_decl(decl ast.FnDecl) ast.FnDecl {
 		ret_name := decl.typ.return_type.name
 		// Qualify with module prefix for enum shorthand resolution
 		// (e.g., Token → token__Token so resolve_enum_shorthand produces token__Token__member)
+		// Skip qualification if the type is a builtin type (e.g., ChanState is defined in
+		// vlib/builtin, so functions in the sync module returning ChanState should NOT
+		// produce sync__ChanState__member — just ChanState__member).
+		mut is_builtin_ret_type := false
+		if !ret_name.contains('__') {
+			if scope := t.get_module_scope('builtin') {
+				if obj := scope.lookup_parent(ret_name, 0) {
+					is_builtin_ret_type = obj is types.Type
+				}
+			}
+			// Fallback: check if module-qualified name does NOT exist as a type.
+			// If `sync__ChanState` is not a real type but `ChanState` is (builtin),
+			// then don't add the module prefix.
+			if !is_builtin_ret_type && t.cur_module != '' {
+				qualified := '${t.cur_module}__${ret_name}'
+				qualified_exists := t.lookup_type(qualified) != none
+				if !qualified_exists {
+					is_builtin_ret_type = true
+				}
+			}
+		}
 		if t.cur_module != '' && t.cur_module != 'main' && t.cur_module != 'builtin'
-			&& !ret_name.contains('__') {
+			&& !ret_name.contains('__') && !is_builtin_ret_type {
 			t.cur_fn_ret_type_name = '${t.cur_module}__${ret_name}'
 		} else {
 			t.cur_fn_ret_type_name = ret_name
@@ -2819,10 +2919,20 @@ fn is_c_type_name_for_cast(name string) bool {
 	// Keep in sync with cleanc `is_c_type_name`.
 	// This list is only used to disambiguate `C.TYPE(x)` casts from `C.fn(x)` calls
 	// in `CallOrCastExpr` lowering.
-	return name in ['FILE', 'DIR', 'va_list', 'pthread_t', 'pthread_mutex_t', 'pthread_cond_t',
+	if name in ['FILE', 'DIR', 'va_list', 'pthread_t', 'pthread_mutex_t', 'pthread_cond_t',
 		'pthread_rwlock_t', 'pthread_attr_t', 'stat', 'tm', 'timespec', 'timeval', 'dirent',
 		'termios', 'sockaddr', 'sockaddr_in', 'sockaddr_in6', 'sockaddr_un',
-		'mach_timebase_info_data_t']
+		'mach_timebase_info_data_t'] {
+		return true
+	}
+	// Module-qualified C type names (e.g. C.log__Logger) are casts, not calls.
+	if name.contains('__') {
+		after := name.all_after_last('__')
+		if after.len > 0 && after[0] >= `A` && after[0] <= `Z` {
+			return true
+		}
+	}
+	return false
 }
 
 fn (t &Transformer) call_or_cast_lhs_is_type(lhs ast.Expr) bool {

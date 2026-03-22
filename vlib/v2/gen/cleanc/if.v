@@ -113,6 +113,12 @@ fn (mut g Gen) expr_is_void_call(expr ast.Expr) bool {
 				return ret == 'void'
 			}
 		}
+		// panic/v_panic always returns void (noreturn)
+		if expr.lhs is ast.Ident {
+			if expr.lhs.name in ['panic', 'v_panic'] {
+				return true
+			}
+		}
 	}
 	return false
 }
